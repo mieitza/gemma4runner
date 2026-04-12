@@ -34,6 +34,16 @@ pub fn inference_event_stream(
                     let ev = Event::default().comment("");
                     Some((Ok(ev), (rx, request_id, model, first)))
                 }
+                Ok(InferenceEvent::ThinkingToken(_)) => {
+                    // Skip thinking tokens in streaming for now
+                    let ev = Event::default().comment("");
+                    Some((Ok(ev), (rx, request_id, model, first)))
+                }
+                Ok(InferenceEvent::ToolCalls(_)) => {
+                    // Skip tool calls in streaming for now
+                    let ev = Event::default().comment("");
+                    Some((Ok(ev), (rx, request_id, model, first)))
+                }
                 Ok(InferenceEvent::Error(e)) => {
                     tracing::error!("Inference error during streaming: {}", e);
                     None
@@ -79,6 +89,7 @@ pub fn inference_event_stream(
                     let finish_reason = match reason {
                         FinishReason::Stop => common::FinishReason::Stop,
                         FinishReason::Length => common::FinishReason::Length,
+                        FinishReason::ToolCalls => common::FinishReason::ToolCalls,
                     };
 
                     let chunk = ChatCompletionChunk {

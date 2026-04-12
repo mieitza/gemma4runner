@@ -39,6 +39,8 @@ pub async fn completions(
         input: InferenceInput::Raw(request.prompt),
         sampling,
         response_tx,
+        tools: vec![],
+        include_thinking: false,
     };
     engine.send(inference_request).map_err(|_| ApiError::too_many_requests("Server is busy. Please retry later."))?;
 
@@ -83,11 +85,14 @@ fn collect_response(rx: mpsc::Receiver<InferenceEvent>) -> anyhow::Result<Collec
     while let Ok(event) = rx.recv() {
         match event {
             InferenceEvent::Token(t) => content.push_str(&t),
+            InferenceEvent::ThinkingToken(_) => { /* skip thinking in completion handler */ }
+            InferenceEvent::ToolCalls(_) => { /* skip tool calls in completion handler */ }
             InferenceEvent::Usage(u) => usage = u,
             InferenceEvent::Done(reason) => {
                 finish_reason = match reason {
                     FinishReason::Stop => common::FinishReason::Stop,
                     FinishReason::Length => common::FinishReason::Length,
+                    FinishReason::ToolCalls => common::FinishReason::Stop,
                 };
                 break;
             }

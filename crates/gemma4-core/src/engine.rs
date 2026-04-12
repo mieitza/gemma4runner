@@ -4,7 +4,7 @@ use std::thread;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
-use crate::chat_template::{format_chat_prompt, ChatMessage};
+use crate::chat_template::ChatMessage;
 use crate::config::Gemma4Config;
 use crate::kv_cache::KvCache;
 use crate::loader;
@@ -23,11 +23,15 @@ pub struct InferenceRequest {
     pub input: InferenceInput,
     pub sampling: SamplingParams,
     pub response_tx: mpsc::Sender<InferenceEvent>,
+    pub tools: Vec<crate::chat_template::ToolDef>,
+    pub include_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum InferenceEvent {
     Token(String),
+    ThinkingToken(String),
+    ToolCalls(Vec<crate::tool_parser::ParsedToolCall>),
     Usage(UsageStats),
     Done(FinishReason),
     Error(String),
@@ -43,11 +47,16 @@ pub struct UsageStats {
 pub enum FinishReason {
     Stop,
     Length,
+    ToolCalls,
 }
 
 impl std::fmt::Display for FinishReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { FinishReason::Stop => write!(f, "stop"), FinishReason::Length => write!(f, "length") }
+        match self {
+            FinishReason::Stop => write!(f, "stop"),
+            FinishReason::Length => write!(f, "length"),
+            FinishReason::ToolCalls => write!(f, "tool_calls"),
+        }
     }
 }
 
@@ -133,7 +142,13 @@ fn process_request(
     request: &InferenceRequest,
 ) -> Result<()> {
     let prompt = match &request.input {
-        InferenceInput::Chat(messages) => format_chat_prompt(messages),
+        InferenceInput::Chat(messages) => {
+            let options = crate::chat_template::ChatFormatOptions {
+                tools: request.tools.clone(),
+                enable_thinking: request.include_thinking,
+            };
+            crate::chat_template::format_chat_prompt_with_options(messages, &options)
+        }
         InferenceInput::Raw(text) => text.clone(),
     };
     let prompt_tokens = tokenizer.encode(&prompt)?;
@@ -164,7 +179,18 @@ fn process_request(
         generated_tokens.push(next_token);
     }
 
-    let finish_reason = if tokenizer.is_eos(next_token) { FinishReason::Stop } else { FinishReason::Length };
+    let mut finish_reason = if tokenizer.is_eos(next_token) { FinishReason::Stop } else { FinishReason::Length };
+
+    // Collect full output text and check for tool calls
+    let full_output = tokenizer.decode(&generated_tokens)?;
+    if crate::tool_parser::has_tool_calls(&full_output) {
+        let parsed = crate::tool_parser::parse_tool_calls(&full_output);
+        if !parsed.is_empty() {
+            let _ = request.response_tx.send(InferenceEvent::ToolCalls(parsed));
+            finish_reason = FinishReason::ToolCalls;
+        }
+    }
+
     let _ = request.response_tx.send(InferenceEvent::Usage(UsageStats { prompt_tokens: prompt_len, completion_tokens: generated_tokens.len() }));
     let _ = request.response_tx.send(InferenceEvent::Done(finish_reason));
     Ok(())

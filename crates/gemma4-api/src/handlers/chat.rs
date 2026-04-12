@@ -45,6 +45,17 @@ pub async fn chat_completions(
         presence_penalty: request.presence_penalty.unwrap_or(0.0),
     };
 
+    let tools: Vec<gemma4_core::chat_template::ToolDef> = request.tools
+        .as_ref()
+        .map(|ts| ts.iter().map(|t| gemma4_core::chat_template::ToolDef {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            parameters: t.function.parameters.clone(),
+        }).collect())
+        .unwrap_or_default();
+
+    let include_thinking = request.include_thinking.unwrap_or(false);
+
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_name = request.model.clone();
     let (response_tx, response_rx) = mpsc::channel();
@@ -54,6 +65,8 @@ pub async fn chat_completions(
         input: InferenceInput::Chat(messages),
         sampling,
         response_tx,
+        tools,
+        include_thinking,
     };
     engine.send(inference_request).map_err(|_| ApiError::too_many_requests("Server is busy. Please retry later."))?;
 
@@ -68,6 +81,19 @@ pub async fn chat_completions(
 
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
+        let api_tool_calls: Option<Vec<common::ToolCall>> = if result.tool_calls.is_empty() {
+            None
+        } else {
+            Some(result.tool_calls.iter().enumerate().map(|(i, tc)| common::ToolCall {
+                id: format!("call_{}", i),
+                tool_type: "function".into(),
+                function: common::FunctionCall {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.to_string(),
+                },
+            }).collect())
+        };
+
         let response = ChatCompletionResponse {
             id: request_id,
             object: "chat.completion".into(),
@@ -75,7 +101,12 @@ pub async fn chat_completions(
             model: model_name,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChoiceMessage { role: "assistant".into(), content: Some(result.content), thinking: None, tool_calls: None },
+                message: ChoiceMessage {
+                    role: "assistant".into(),
+                    content: Some(result.content),
+                    thinking: result.thinking,
+                    tool_calls: api_tool_calls,
+                },
                 finish_reason: result.finish_reason,
             }],
             usage: common::Usage {
@@ -91,23 +122,32 @@ pub async fn chat_completions(
 
 struct CollectedResponse {
     content: String,
+    thinking: Option<String>,
+    tool_calls: Vec<gemma4_core::tool_parser::ParsedToolCall>,
     finish_reason: common::FinishReason,
     usage: gemma4_core::engine::UsageStats,
 }
 
 fn collect_response(rx: mpsc::Receiver<InferenceEvent>) -> anyhow::Result<CollectedResponse> {
     let mut content = String::new();
+    let mut thinking: Option<String> = None;
+    let mut tool_calls: Vec<gemma4_core::tool_parser::ParsedToolCall> = vec![];
     let mut finish_reason = common::FinishReason::Stop;
     let mut usage = gemma4_core::engine::UsageStats { prompt_tokens: 0, completion_tokens: 0 };
 
     while let Ok(event) = rx.recv() {
         match event {
             InferenceEvent::Token(t) => content.push_str(&t),
+            InferenceEvent::ThinkingToken(t) => {
+                thinking.get_or_insert_with(String::new).push_str(&t);
+            }
+            InferenceEvent::ToolCalls(tc) => { tool_calls = tc; }
             InferenceEvent::Usage(u) => usage = u,
             InferenceEvent::Done(reason) => {
                 finish_reason = match reason {
                     FinishReason::Stop => common::FinishReason::Stop,
                     FinishReason::Length => common::FinishReason::Length,
+                    FinishReason::ToolCalls => common::FinishReason::ToolCalls,
                 };
                 break;
             }
@@ -115,5 +155,5 @@ fn collect_response(rx: mpsc::Receiver<InferenceEvent>) -> anyhow::Result<Collec
         }
     }
 
-    Ok(CollectedResponse { content, finish_reason, usage })
+    Ok(CollectedResponse { content, thinking, tool_calls, finish_reason, usage })
 }
