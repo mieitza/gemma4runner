@@ -38,6 +38,16 @@ pub struct Gemma4TextConfig {
     pub layer_types: Vec<String>,
     #[serde(default)]
     pub rope_parameters: Option<RopeParameters>,
+    #[serde(default)]
+    pub enable_moe_block: bool,
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub top_k_experts: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub num_global_key_value_heads: Option<usize>,
 }
 
 impl Gemma4TextConfig {
@@ -63,9 +73,14 @@ impl Gemma4TextConfig {
     }
 
     /// Returns the number of key-value heads for a given layer.
-    /// Full-attention layers keep the same kv-head count; sliding layers use
-    /// the configured num_key_value_heads.
-    pub fn kv_heads_for_layer(&self, _layer_idx: usize) -> usize {
+    /// Full-attention layers use num_global_key_value_heads when set; sliding
+    /// layers use the configured num_key_value_heads.
+    pub fn kv_heads_for_layer(&self, layer_idx: usize) -> usize {
+        if !self.is_sliding_layer(layer_idx) {
+            if let Some(global_kv) = self.num_global_key_value_heads {
+                return global_kv;
+            }
+        }
         self.num_key_value_heads
     }
 
@@ -182,6 +197,56 @@ mod tests {
         assert!(config.text_config.is_sliding_layer(0));
         assert!(config.text_config.is_sliding_layer(4));
         assert!(!config.text_config.is_sliding_layer(5));
+    }
+
+    #[test]
+    fn test_parse_moe_config() {
+        let json = r#"{
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "attention_bias": false,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "hidden_size": 2816,
+                "intermediate_size": 2112,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 6,
+                "num_key_value_heads": 8,
+                "num_global_key_value_heads": 2,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "rms_norm_eps": 1e-06,
+                "vocab_size": 262144,
+                "max_position_embeddings": 262144,
+                "sliding_window": 1024,
+                "final_logit_softcapping": 30.0,
+                "tie_word_embeddings": true,
+                "enable_moe_block": true,
+                "num_experts": 128,
+                "top_k_experts": 8,
+                "moe_intermediate_size": 704,
+                "layer_types": [
+                    "sliding_attention","sliding_attention","sliding_attention",
+                    "sliding_attention","sliding_attention","full_attention"
+                ],
+                "rope_parameters": {
+                    "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+                    "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+                }
+            },
+            "image_token_id": 258880,
+            "audio_token_id": 258881,
+            "eos_token_id": [1, 106]
+        }"#;
+        let config: Gemma4Config = serde_json::from_str(json).unwrap();
+        let tc = &config.text_config;
+        assert!(tc.enable_moe_block);
+        assert_eq!(tc.num_experts.unwrap(), 128);
+        assert_eq!(tc.top_k_experts.unwrap(), 8);
+        assert_eq!(tc.moe_intermediate_size.unwrap(), 704);
+        assert_eq!(tc.num_global_key_value_heads.unwrap(), 2);
+        assert_eq!(tc.kv_heads_for_layer(5), 2);  // global layer uses global KV heads
+        assert_eq!(tc.kv_heads_for_layer(0), 8);  // sliding layer uses regular KV heads
     }
 
     #[test]
