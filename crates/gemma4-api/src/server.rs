@@ -11,6 +11,7 @@ pub fn build_router(engine: EngineHandle, api_key: Option<String>, metrics: Metr
         .route("/v1/completions", post(handlers::completion::completions))
         .route("/v1/models", get(handlers::models::list_models))
         .route("/health", get(handlers::health::health))
+        .layer(axum::Extension(metrics.clone()))
         .with_state(engine);
 
     let metrics_router = Router::new()

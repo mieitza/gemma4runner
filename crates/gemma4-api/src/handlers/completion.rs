@@ -1,18 +1,21 @@
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
+use axum::Extension;
 use axum::Json;
 use axum::response::IntoResponse;
 
 use gemma4_core::engine::{EngineHandle, FinishReason, InferenceEvent, InferenceInput, InferenceRequest};
 use gemma4_core::sampling::SamplingParams;
 
+use crate::metrics::Metrics;
 use crate::types::completion::*;
 use crate::types::common;
 use crate::types::error::ApiError;
 
 pub async fn completions(
     State(engine): State<EngineHandle>,
+    Extension(metrics): Extension<Metrics>,
     Json(request): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if request.prompt.is_empty() {
@@ -44,10 +47,18 @@ pub async fn completions(
     };
     engine.send(inference_request).map_err(|_| ApiError::too_many_requests("Server is busy. Please retry later."))?;
 
+    let start = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || collect_response(response_rx))
         .await
         .map_err(|e| ApiError::internal(format!("Task join error: {}", e)))?
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    let inference_ms = start.elapsed().as_millis() as u64;
+
+    metrics.record_request(
+        result.usage.prompt_tokens as u64,
+        result.usage.completion_tokens as u64,
+        inference_ms,
+    );
 
     let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 

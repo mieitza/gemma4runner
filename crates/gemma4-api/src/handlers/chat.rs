@@ -1,6 +1,7 @@
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
+use axum::Extension;
 use axum::Json;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -9,6 +10,7 @@ use gemma4_core::chat_template::ChatMessage;
 use gemma4_core::engine::{EngineHandle, FinishReason, InferenceEvent, InferenceInput, InferenceRequest};
 use gemma4_core::sampling::SamplingParams;
 
+use crate::metrics::Metrics;
 use crate::types::chat::*;
 use crate::types::common;
 use crate::types::error::ApiError;
@@ -16,6 +18,7 @@ use crate::streaming::inference_event_stream;
 
 pub async fn chat_completions(
     State(engine): State<EngineHandle>,
+    Extension(metrics): Extension<Metrics>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     if request.messages.is_empty() {
@@ -30,8 +33,13 @@ pub async fn chat_completions(
             common::Role::Tool => "tool".into(),
         },
         content: m.content.clone().unwrap_or_default(),
-        tool_calls: None,
-        tool_call_id: None,
+        tool_calls: m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|tc| {
+            gemma4_core::chat_template::ToolCallInfo {
+                name: tc.function.name.clone(),
+                arguments: tc.function.arguments.clone(),
+            }
+        }).collect()),
+        tool_call_id: m.tool_call_id.clone(),
     }).collect();
 
     let sampling = SamplingParams {
@@ -74,10 +82,18 @@ pub async fn chat_completions(
         let stream = inference_event_stream(response_rx, request_id, model_name);
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
+        let start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || collect_response(response_rx))
             .await
             .map_err(|e| ApiError::internal(format!("Task join error: {}", e)))?
             .map_err(|e| ApiError::internal(e.to_string()))?;
+        let inference_ms = start.elapsed().as_millis() as u64;
+
+        metrics.record_request(
+            result.usage.prompt_tokens as u64,
+            result.usage.completion_tokens as u64,
+            inference_ms,
+        );
 
         let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 

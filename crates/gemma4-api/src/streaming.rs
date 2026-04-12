@@ -14,8 +14,14 @@ pub fn inference_event_stream(
     model: String,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     futures::stream::unfold(
-        (rx, request_id, model, true),
-        move |(rx, request_id, model, mut first)| async move {
+        (rx, request_id, model, true, false),
+        move |(rx, request_id, model, mut first, done)| async move {
+            // If we already emitted the finish_reason chunk, now emit [DONE] and stop.
+            if done {
+                let ev = Event::default().data("[DONE]");
+                return Some((Ok(ev), (rx, request_id, model, first, false)));
+            }
+
             let event = tokio::task::spawn_blocking(move || {
                 let result = rx.recv();
                 (result, rx)
@@ -32,17 +38,17 @@ pub fn inference_event_stream(
                 Ok(InferenceEvent::Usage(_)) => {
                     // Skip usage events — emit an empty SSE comment to keep the connection alive
                     let ev = Event::default().comment("");
-                    Some((Ok(ev), (rx, request_id, model, first)))
+                    Some((Ok(ev), (rx, request_id, model, first, false)))
                 }
                 Ok(InferenceEvent::ThinkingToken(_)) => {
                     // Skip thinking tokens in streaming for now
                     let ev = Event::default().comment("");
-                    Some((Ok(ev), (rx, request_id, model, first)))
+                    Some((Ok(ev), (rx, request_id, model, first, false)))
                 }
                 Ok(InferenceEvent::ToolCalls(_)) => {
                     // Skip tool calls in streaming for now
                     let ev = Event::default().comment("");
-                    Some((Ok(ev), (rx, request_id, model, first)))
+                    Some((Ok(ev), (rx, request_id, model, first, false)))
                 }
                 Ok(InferenceEvent::Error(e)) => {
                     tracing::error!("Inference error during streaming: {}", e);
@@ -78,7 +84,7 @@ pub fn inference_event_stream(
 
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
                     let ev = Event::default().data(data);
-                    Some((Ok(ev), (rx, request_id, model, first)))
+                    Some((Ok(ev), (rx, request_id, model, first, false)))
                 }
                 Ok(InferenceEvent::Done(reason)) => {
                     let created = SystemTime::now()
@@ -109,8 +115,8 @@ pub fn inference_event_stream(
 
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
                     let ev = Event::default().data(data);
-                    // After Done, the next recv will fail (channel closed) and return None
-                    Some((Ok(ev), (rx, request_id, model, first)))
+                    // Set done=true so next iteration emits [DONE] and stops.
+                    Some((Ok(ev), (rx, request_id, model, first, true)))
                 }
             }
         },

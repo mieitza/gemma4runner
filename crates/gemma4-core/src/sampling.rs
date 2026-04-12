@@ -38,11 +38,39 @@ impl LogitsProcessor {
         Self { rng }
     }
 
-    pub fn sample(&mut self, logits: &Tensor, params: &SamplingParams) -> Result<u32> {
+    pub fn sample(&mut self, logits: &Tensor, params: &SamplingParams, previous_tokens: &[u32]) -> Result<u32> {
         let logits = logits.to_dtype(candle_core::DType::F32)?.flatten_all()?;
         let mut logits_vec: Vec<f32> = logits.to_vec1()?;
 
-        // Greedy: temperature == 0
+        // Apply repetition penalty
+        if params.repetition_penalty != 1.0 {
+            for &token_id in previous_tokens {
+                if (token_id as usize) < logits_vec.len() {
+                    let logit = &mut logits_vec[token_id as usize];
+                    if *logit > 0.0 {
+                        *logit /= params.repetition_penalty as f32;
+                    } else {
+                        *logit *= params.repetition_penalty as f32;
+                    }
+                }
+            }
+        }
+
+        // Apply frequency and presence penalties
+        if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+            let mut token_counts = std::collections::HashMap::new();
+            for &t in previous_tokens {
+                *token_counts.entry(t).or_insert(0u32) += 1;
+            }
+            for (&token_id, &count) in &token_counts {
+                if (token_id as usize) < logits_vec.len() {
+                    logits_vec[token_id as usize] -= params.frequency_penalty as f32 * count as f32;
+                    logits_vec[token_id as usize] -= params.presence_penalty as f32;
+                }
+            }
+        }
+
+        // Greedy: temperature == 0 (applied after penalties)
         if params.temperature == 0.0 {
             let token = logits_vec.iter().enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
@@ -108,7 +136,7 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 5.0, 2.0, 0.5], &Device::Cpu).unwrap();
         let params = SamplingParams { temperature: 0.0, ..Default::default() };
         let mut proc = LogitsProcessor::new(Some(42));
-        let token = proc.sample(&logits, &params).unwrap();
+        let token = proc.sample(&logits, &params, &[]).unwrap();
         assert_eq!(token, 1);
     }
 
@@ -118,7 +146,7 @@ mod tests {
         let params = SamplingParams { temperature: 1.0, ..Default::default() };
         let mut proc1 = LogitsProcessor::new(Some(42));
         let mut proc2 = LogitsProcessor::new(Some(42));
-        assert_eq!(proc1.sample(&logits, &params).unwrap(), proc2.sample(&logits, &params).unwrap());
+        assert_eq!(proc1.sample(&logits, &params, &[]).unwrap(), proc2.sample(&logits, &params, &[]).unwrap());
     }
 
     #[test]
@@ -126,7 +154,22 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 10.0, 2.0, 3.0], &Device::Cpu).unwrap();
         let params = SamplingParams { temperature: 1.0, top_k: Some(1), ..Default::default() };
         let mut proc = LogitsProcessor::new(Some(42));
-        assert_eq!(proc.sample(&logits, &params).unwrap(), 1);
+        assert_eq!(proc.sample(&logits, &params, &[]).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_repetition_penalty_applied() {
+        // Token 1 has the highest logit; with a large repetition penalty it should be suppressed.
+        let logits = Tensor::new(&[1.0f32, 5.0, 2.0, 3.0], &Device::Cpu).unwrap();
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 100.0,
+            ..Default::default()
+        };
+        let mut proc = LogitsProcessor::new(Some(42));
+        // With token 1 in history and a huge penalty, token 1 should no longer win.
+        let token = proc.sample(&logits, &params, &[1]).unwrap();
+        assert_ne!(token, 1);
     }
 
     #[test]

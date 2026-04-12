@@ -212,18 +212,28 @@ fn process_request(
 
     let mut cache = KvCache::new(&config.text_config.layer_types, config.text_config.sliding_window);
     let mut logits_processor = LogitsProcessor::new(request.sampling.seed);
+    let mut think_parser = crate::think_parser::ThinkParser::new(request.include_thinking);
 
     // Prefill
     let input = Tensor::new(prompt_tokens.as_slice(), device)?.unsqueeze(0)?;
     let logits = model.forward(&input, &mut cache, 0)?;
     let logits = logits.squeeze(0)?.squeeze(0)?;
-    let mut next_token = logits_processor.sample(&logits, &request.sampling)?;
+    let mut next_token = logits_processor.sample(&logits, &request.sampling, &[])?;
     let mut generated_tokens: Vec<u32> = vec![next_token];
 
     // Check if first token is already EOS before entering decode loop
     if !tokenizer.is_eos(next_token) {
         let token_text = tokenizer.decode(&[next_token])?;
-        let _ = request.response_tx.send(InferenceEvent::Token(token_text));
+        for event in think_parser.feed(&token_text) {
+            match event {
+                crate::think_parser::ThinkEvent::Content(s) => {
+                    let _ = request.response_tx.send(InferenceEvent::Token(s));
+                }
+                crate::think_parser::ThinkEvent::Thinking(s) => {
+                    let _ = request.response_tx.send(InferenceEvent::ThinkingToken(s));
+                }
+            }
+        }
 
         // Decode loop
         for step in 0..request.sampling.max_tokens {
@@ -231,11 +241,32 @@ fn process_request(
             let seqlen_offset = prompt_len + step;
             let logits = model.forward(&input, &mut cache, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?;
-            next_token = logits_processor.sample(&logits, &request.sampling)?;
+            next_token = logits_processor.sample(&logits, &request.sampling, &generated_tokens)?;
             generated_tokens.push(next_token);
             if tokenizer.is_eos(next_token) { break; }
             let token_text = tokenizer.decode(&[next_token])?;
-            let _ = request.response_tx.send(InferenceEvent::Token(token_text));
+            for event in think_parser.feed(&token_text) {
+                match event {
+                    crate::think_parser::ThinkEvent::Content(s) => {
+                        let _ = request.response_tx.send(InferenceEvent::Token(s));
+                    }
+                    crate::think_parser::ThinkEvent::Thinking(s) => {
+                        let _ = request.response_tx.send(InferenceEvent::ThinkingToken(s));
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush any remaining buffered text from the think parser
+    for event in think_parser.flush() {
+        match event {
+            crate::think_parser::ThinkEvent::Content(s) => {
+                let _ = request.response_tx.send(InferenceEvent::Token(s));
+            }
+            crate::think_parser::ThinkEvent::Thinking(s) => {
+                let _ = request.response_tx.send(InferenceEvent::ThinkingToken(s));
+            }
         }
     }
 
