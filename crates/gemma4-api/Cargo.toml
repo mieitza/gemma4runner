@@ -1,0 +1,14 @@
+[package]
+name = "gemma4-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gemma4-core = { path = "../gemma4-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }

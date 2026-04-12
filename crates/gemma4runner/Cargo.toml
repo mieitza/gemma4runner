@@ -1,0 +1,22 @@
+[package]
+name = "gemma4runner"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gemma4runner"
+path = "src/main.rs"
+
+[dependencies]
+gemma4-core = { path = "../gemma4-core" }
+gemma4-api = { path = "../gemma4-api" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[features]
+default = []
+metal = ["gemma4-core/metal"]
+cuda = ["gemma4-core/cuda"]
