@@ -21,8 +21,8 @@ pub fn build_router(engine: EngineHandle, api_key: Option<String>, metrics: Metr
 
     if let Some(key) = api_key {
         app = app
-            .layer(axum::Extension(ApiKey(key)))
-            .layer(axum::middleware::from_fn(auth_middleware));
+            .layer(axum::middleware::from_fn(auth_middleware))
+            .layer(axum::Extension(ApiKey(key)));
     }
     app
 }

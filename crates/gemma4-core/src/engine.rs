@@ -131,7 +131,8 @@ pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Re
         let tokenizer_path = model_path.parent()
             .unwrap_or(Path::new("."))
             .join("tokenizer.json");
-        let tokenizer = GemmaTokenizer::from_file(&tokenizer_path, vec![])?;
+        let eos_ids = vec![1u32, 106]; // <eos> and <turn|>
+        let tokenizer = GemmaTokenizer::from_file(&tokenizer_path, eos_ids.clone())?;
 
         let q_model = crate::quantized_model::QuantizedGemmaModel::new(
             &text_config,
@@ -144,7 +145,7 @@ pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Re
             text_config,
             image_token_id: None,
             audio_token_id: None,
-            eos_token_id: vec![],
+            eos_token_id: eos_ids,
         };
 
         (ModelBackend::Quantized(q_model), tokenizer, full_config)
@@ -219,18 +220,23 @@ fn process_request(
     let mut next_token = logits_processor.sample(&logits, &request.sampling)?;
     let mut generated_tokens: Vec<u32> = vec![next_token];
 
-    // Decode loop
-    for step in 0..request.sampling.max_tokens {
-        if tokenizer.is_eos(next_token) { break; }
+    // Check if first token is already EOS before entering decode loop
+    if !tokenizer.is_eos(next_token) {
         let token_text = tokenizer.decode(&[next_token])?;
         let _ = request.response_tx.send(InferenceEvent::Token(token_text));
 
-        let input = Tensor::new(&[next_token], device)?.unsqueeze(0)?;
-        let seqlen_offset = prompt_len + step + 1;
-        let logits = model.forward(&input, &mut cache, seqlen_offset)?;
-        let logits = logits.squeeze(0)?.squeeze(0)?;
-        next_token = logits_processor.sample(&logits, &request.sampling)?;
-        generated_tokens.push(next_token);
+        // Decode loop
+        for step in 0..request.sampling.max_tokens {
+            let input = Tensor::new(&[next_token], device)?.unsqueeze(0)?;
+            let seqlen_offset = prompt_len + step;
+            let logits = model.forward(&input, &mut cache, seqlen_offset)?;
+            let logits = logits.squeeze(0)?.squeeze(0)?;
+            next_token = logits_processor.sample(&logits, &request.sampling)?;
+            generated_tokens.push(next_token);
+            if tokenizer.is_eos(next_token) { break; }
+            let token_text = tokenizer.decode(&[next_token])?;
+            let _ = request.response_tx.send(InferenceEvent::Token(token_text));
+        }
     }
 
     let mut finish_reason = if tokenizer.is_eos(next_token) { FinishReason::Stop } else { FinishReason::Length };

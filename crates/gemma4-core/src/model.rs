@@ -34,9 +34,9 @@ impl DecoderLayer {
         let (moe_block, post_feedforward_layernorm_1) = if cfg.enable_moe_block {
             let moe = crate::moe::MoeBlock::new(
                 cfg.hidden_size,
-                cfg.moe_intermediate_size.unwrap_or(704),
                 cfg.num_experts.unwrap_or(128),
                 cfg.top_k_experts.unwrap_or(8),
+                cfg.moe_intermediate_size.unwrap_or(704),
                 cfg.rms_norm_eps,
                 vb.clone(),
             )?;
