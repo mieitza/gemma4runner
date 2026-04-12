@@ -52,7 +52,7 @@ pub async fn chat_completions(
         sampling,
         response_tx,
     };
-    engine.send(inference_request).map_err(|e| ApiError::service_unavailable(e.to_string()))?;
+    engine.send(inference_request).map_err(|_| ApiError::too_many_requests("Server is busy. Please retry later."))?;
 
     if request.stream.unwrap_or(false) {
         let stream = inference_event_stream(response_rx, request_id, model_name);

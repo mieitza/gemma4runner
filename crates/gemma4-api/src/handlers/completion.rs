@@ -40,7 +40,7 @@ pub async fn completions(
         sampling,
         response_tx,
     };
-    engine.send(inference_request).map_err(|e| ApiError::service_unavailable(e.to_string()))?;
+    engine.send(inference_request).map_err(|_| ApiError::too_many_requests("Server is busy. Please retry later."))?;
 
     let result = tokio::task::spawn_blocking(move || collect_response(response_rx))
         .await

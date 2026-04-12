@@ -32,6 +32,11 @@ impl ApiError {
             message: message.into(), error_type: "service_unavailable".into(), param: None, code: None,
         }}}
     }
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::TOO_MANY_REQUESTS, body: ApiErrorResponse { error: ApiErrorBody {
+            message: message.into(), error_type: "rate_limit_error".into(), param: None, code: None,
+        }}}
+    }
 }
 
 impl IntoResponse for ApiError {
