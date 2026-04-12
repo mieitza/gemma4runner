@@ -1,1 +1,3 @@
-// Placeholder — implemented in Task 5
+pub mod chat;
+pub mod common;
+pub mod error;
