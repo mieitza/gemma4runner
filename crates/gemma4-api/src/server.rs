@@ -6,6 +6,7 @@ use crate::handlers;
 pub fn build_router(engine: EngineHandle) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(handlers::chat::chat_completions))
+        .route("/v1/completions", post(handlers::completion::completions))
         .route("/health", get(handlers::health::health))
         .with_state(engine)
 }
