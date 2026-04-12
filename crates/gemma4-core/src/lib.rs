@@ -12,3 +12,4 @@ pub mod tokenizer;
 pub mod engine;
 pub mod think_parser;
 pub mod tool_parser;
+pub mod multimodal;
