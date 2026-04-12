@@ -60,6 +60,26 @@ impl std::fmt::Display for FinishReason {
     }
 }
 
+/// Dispatch enum over the two model backends (safetensors and quantized GGUF).
+enum ModelBackend {
+    Safetensors(crate::model::GemmaTextModel),
+    Quantized(crate::quantized_model::QuantizedGemmaModel),
+}
+
+impl ModelBackend {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut KvCache,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Safetensors(m) => m.forward(input_ids, cache, seqlen_offset),
+            Self::Quantized(m) => m.forward(input_ids, cache, seqlen_offset),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     request_tx: mpsc::SyncSender<InferenceRequest>,
@@ -100,27 +120,61 @@ pub fn device_from_string(s: &str) -> Result<Device> {
 }
 
 pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Result<EngineHandle> {
-    let dtype = match &device {
-        Device::Cpu => DType::F32,
-        _ => DType::BF16,
+    let (backend, tokenizer, config) = if loader::is_gguf_file(model_path) {
+        // --- GGUF path ---
+        tracing::info!("Detected GGUF file: {}", model_path.display());
+
+        let gguf = crate::gguf_loader::GgufModel::load(model_path, &device)?;
+        let text_config = gguf.config.clone();
+
+        // Tokenizer must be alongside the GGUF file (same directory)
+        let tokenizer_path = model_path.parent()
+            .unwrap_or(Path::new("."))
+            .join("tokenizer.json");
+        let tokenizer = GemmaTokenizer::from_file(&tokenizer_path, vec![])?;
+
+        let q_model = crate::quantized_model::QuantizedGemmaModel::new(
+            &text_config,
+            &gguf,
+            &device,
+        )?;
+
+        // Wrap the text config in a full Gemma4Config (no image/audio tokens for GGUF)
+        let full_config = Gemma4Config {
+            text_config,
+            image_token_id: None,
+            audio_token_id: None,
+            eos_token_id: vec![],
+        };
+
+        (ModelBackend::Quantized(q_model), tokenizer, full_config)
+    } else {
+        // --- Safetensors path ---
+        let dtype = match &device {
+            Device::Cpu => DType::F32,
+            _ => DType::BF16,
+        };
+        let loaded = loader::load_model(model_path, &device, dtype)?;
+        let tokenizer_path = model_path.join("tokenizer.json");
+        let tokenizer = GemmaTokenizer::from_file(
+            &tokenizer_path,
+            loaded.config.eos_token_id.clone(),
+        )?;
+        let config = loaded.config;
+        (ModelBackend::Safetensors(loaded.model), tokenizer, config)
     };
-    let loaded = loader::load_model(model_path, &device, dtype)?;
-    let tokenizer_path = model_path.join("tokenizer.json");
-    let tokenizer = GemmaTokenizer::from_file(&tokenizer_path, loaded.config.eos_token_id.clone())?;
 
     let (request_tx, request_rx) = mpsc::sync_channel::<InferenceRequest>(queue_depth);
-    let config = loaded.config.clone();
-    let model = loaded.model;
 
     thread::Builder::new()
         .name("inference-engine".to_string())
-        .spawn(move || { engine_loop(model, tokenizer, config, device, request_rx); })?;
+        .spawn(move || { engine_loop(backend, tokenizer, config, device, request_rx); })?;
 
     Ok(EngineHandle { request_tx })
 }
 
 fn engine_loop(
-    model: crate::model::GemmaTextModel,
+    model: ModelBackend,
     tokenizer: GemmaTokenizer,
     config: Gemma4Config,
     device: Device,
@@ -135,7 +189,7 @@ fn engine_loop(
 }
 
 fn process_request(
-    model: &crate::model::GemmaTextModel,
+    model: &ModelBackend,
     tokenizer: &GemmaTokenizer,
     config: &Gemma4Config,
     device: &Device,

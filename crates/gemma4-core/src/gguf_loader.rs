@@ -4,6 +4,7 @@ use candle_core::quantized::gguf_file;
 use candle_core::Device;
 
 use crate::config::Gemma4TextConfig;
+use crate::quantized_model::TensorLoader;
 
 /// Parsed GGUF model with metadata and tensor access.
 pub struct GgufModel {
@@ -40,6 +41,12 @@ impl GgufModel {
         let mut file = std::fs::File::open(&self.file_path)?;
         self.content.tensor(&mut file, name, device)
             .with_context(|| format!("Failed to load tensor: {}", name))
+    }
+}
+
+impl TensorLoader for GgufModel {
+    fn load(&self, name: &str, device: &Device) -> Result<candle_core::quantized::QTensor> {
+        self.tensor(name, device)
     }
 }
 
