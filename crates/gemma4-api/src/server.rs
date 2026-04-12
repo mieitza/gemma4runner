@@ -2,15 +2,22 @@ use axum::routing::{get, post};
 use axum::Router;
 use gemma4_core::engine::EngineHandle;
 use crate::handlers;
+use crate::metrics::Metrics;
 use crate::middleware::{ApiKey, auth_middleware};
 
-pub fn build_router(engine: EngineHandle, api_key: Option<String>) -> Router {
+pub fn build_router(engine: EngineHandle, api_key: Option<String>, metrics: Metrics) -> Router {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(handlers::chat::chat_completions))
         .route("/v1/completions", post(handlers::completion::completions))
         .route("/v1/models", get(handlers::models::list_models))
         .route("/health", get(handlers::health::health))
         .with_state(engine);
+
+    let metrics_router = Router::new()
+        .route("/metrics", get(handlers::metrics::get_metrics))
+        .with_state(metrics);
+
+    app = app.merge(metrics_router);
 
     if let Some(key) = api_key {
         app = app
@@ -21,7 +28,8 @@ pub fn build_router(engine: EngineHandle, api_key: Option<String>) -> Router {
 }
 
 pub async fn start_server(engine: EngineHandle, host: &str, port: u16, api_key: Option<String>) -> anyhow::Result<()> {
-    let app = build_router(engine, api_key);
+    let metrics = Metrics::new();
+    let app = build_router(engine, api_key, metrics);
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Listening on http://{}", addr);
