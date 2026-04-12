@@ -10,3 +10,5 @@ pub mod model;
 pub mod loader;
 pub mod tokenizer;
 pub mod engine;
+pub mod think_parser;
+pub mod tool_parser;
