@@ -11,7 +11,7 @@ pub struct LoadedModel {
     pub config: Gemma4Config,
 }
 
-pub fn load_model(model_dir: &Path, device: &Device) -> Result<LoadedModel> {
+pub fn load_model(model_dir: &Path, device: &Device, dtype: DType) -> Result<LoadedModel> {
     let config_path = model_dir.join("config.json");
     let config: Gemma4Config = serde_json::from_reader(
         std::fs::File::open(&config_path)
@@ -21,7 +21,6 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<LoadedModel> {
     let safetensor_files = find_safetensor_files(model_dir)?;
     tracing::info!("Loading {} safetensor file(s) from {}", safetensor_files.len(), model_dir.display());
 
-    let dtype = DType::F32;
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&safetensor_files, dtype, device)
             .context("Failed to load safetensors")?

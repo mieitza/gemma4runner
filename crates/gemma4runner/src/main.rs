@@ -2,6 +2,7 @@ mod cli;
 
 use std::path::PathBuf;
 use anyhow::Result;
+use candle_core::Device;
 use clap::Parser;
 use cli::{Cli, Commands};
 
@@ -18,7 +19,7 @@ async fn main() -> Result<()> {
             anyhow::ensure!(model_path.exists(), "Model path does not exist: {}", model_path.display());
 
             tracing::info!("Loading model from {}", model_path.display());
-            let engine = gemma4_core::engine::start_engine(&model_path, queue_depth)?;
+            let engine = gemma4_core::engine::start_engine(&model_path, Device::Cpu, queue_depth)?;
 
             tracing::info!("Starting server on {}:{}", host, port);
             gemma4_api::server::start_server(engine, &host, port).await?;

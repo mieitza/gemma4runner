@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 
 use crate::chat_template::{format_chat_prompt, ChatMessage};
 use crate::config::Gemma4Config;
@@ -12,9 +12,15 @@ use crate::sampling::{LogitsProcessor, SamplingParams};
 use crate::tokenizer::GemmaTokenizer;
 
 #[derive(Debug)]
+pub enum InferenceInput {
+    Chat(Vec<ChatMessage>),
+    Raw(String),
+}
+
+#[derive(Debug)]
 pub struct InferenceRequest {
     pub id: String,
-    pub messages: Vec<ChatMessage>,
+    pub input: InferenceInput,
     pub sampling: SamplingParams,
     pub response_tx: mpsc::Sender<InferenceEvent>,
 }
@@ -57,9 +63,39 @@ impl EngineHandle {
     }
 }
 
-pub fn start_engine(model_path: &Path, queue_depth: usize) -> Result<EngineHandle> {
-    let device = Device::Cpu;
-    let loaded = loader::load_model(model_path, &device)?;
+pub fn device_from_string(s: &str) -> Result<Device> {
+    match s {
+        "cpu" => Ok(Device::Cpu),
+        #[cfg(feature = "metal")]
+        "metal" => Ok(Device::new_metal(0)?),
+        #[cfg(feature = "cuda")]
+        "cuda" => Ok(Device::new_cuda(0)?),
+        "auto" => {
+            #[cfg(feature = "metal")]
+            { return Ok(Device::new_metal(0)?); }
+            #[cfg(feature = "cuda")]
+            { return Ok(Device::new_cuda(0)?); }
+            #[allow(unreachable_code)]
+            Ok(Device::Cpu)
+        }
+        other => {
+            #[cfg(feature = "cuda")]
+            if let Some(idx_str) = other.strip_prefix("cuda:") {
+                let idx: usize = idx_str.parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid CUDA device index: {}", idx_str))?;
+                return Ok(Device::new_cuda(idx)?);
+            }
+            Err(anyhow::anyhow!("Unknown device: {}", other))
+        }
+    }
+}
+
+pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Result<EngineHandle> {
+    let dtype = match &device {
+        Device::Cpu => DType::F32,
+        _ => DType::BF16,
+    };
+    let loaded = loader::load_model(model_path, &device, dtype)?;
     let tokenizer_path = model_path.join("tokenizer.json");
     let tokenizer = GemmaTokenizer::from_file(&tokenizer_path, loaded.config.eos_token_id.clone())?;
 
@@ -96,7 +132,10 @@ fn process_request(
     device: &Device,
     request: &InferenceRequest,
 ) -> Result<()> {
-    let prompt = format_chat_prompt(&request.messages);
+    let prompt = match &request.input {
+        InferenceInput::Chat(messages) => format_chat_prompt(messages),
+        InferenceInput::Raw(text) => text.clone(),
+    };
     let prompt_tokens = tokenizer.encode(&prompt)?;
     let prompt_len = prompt_tokens.len();
     tracing::debug!("Prompt: {} tokens", prompt_len);
