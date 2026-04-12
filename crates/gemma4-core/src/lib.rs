@@ -4,6 +4,7 @@ pub mod sampling;
 pub mod kv_cache;
 pub mod rope;
 pub mod mlp;
+pub mod moe;
 pub mod attention;
 pub mod model;
 pub mod loader;

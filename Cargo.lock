@@ -1357,6 +1357,7 @@ dependencies = [
  "gemma4-api",
  "gemma4-core",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",

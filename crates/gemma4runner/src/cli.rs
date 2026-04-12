@@ -21,4 +21,11 @@ pub enum Commands {
         #[arg(long)] log_level: Option<String>,
         #[arg(long)] queue_depth: Option<usize>,
     },
+    /// Print model details without loading weights
+    Info {
+        #[arg(long)]
+        model: String,
+        #[arg(long, env = "HF_TOKEN")]
+        hf_token: Option<String>,
+    },
 }

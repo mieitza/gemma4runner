@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands};
 use config::AppConfig;
+use std::fs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,6 +41,53 @@ async fn main() -> Result<()> {
 
             tracing::info!("Starting server on {}:{}", host, port);
             gemma4_api::server::start_server(engine, &host, port, api_key).await?;
+            Ok(())
+        }
+        Commands::Info { model, hf_token } => {
+            let model_path = gemma4_core::loader::resolve_model_source(&model, hf_token.as_deref())?;
+            let config_path = model_path.join("config.json");
+            let config: gemma4_core::config::Gemma4Config = serde_json::from_reader(
+                fs::File::open(&config_path)
+                    .with_context(|| format!("Failed to open {}", config_path.display()))?,
+            ).context("Failed to parse config.json")?;
+            let tc = &config.text_config;
+
+            println!("Model source : {}", model_path.display());
+            println!("Hidden size  : {}", tc.hidden_size);
+            println!("Layers       : {}", tc.num_hidden_layers);
+            println!("Attn heads   : {}", tc.num_attention_heads);
+            println!("KV heads     : {}", tc.num_key_value_heads);
+            if let Some(global_kv) = tc.num_global_key_value_heads {
+                println!("Global KV heads : {}", global_kv);
+            }
+            println!("Head dim     : {}", tc.head_dim);
+            if tc.global_head_dim > 0 {
+                println!("Global head dim : {}", tc.global_head_dim);
+            }
+            println!("Vocab size   : {}", tc.vocab_size);
+            println!("Max context  : {}", tc.max_position_embeddings);
+            println!("Sliding win  : {}", tc.sliding_window);
+
+            if tc.enable_moe_block {
+                println!("MoE          : enabled");
+                if let Some(n) = tc.num_experts {
+                    println!("  Num experts       : {}", n);
+                }
+                if let Some(k) = tc.top_k_experts {
+                    println!("  Top-k experts     : {}", k);
+                }
+                if let Some(moe_sz) = tc.moe_intermediate_size {
+                    println!("  MoE interm size   : {}", moe_sz);
+                }
+                println!("  Dense interm size : {}", tc.intermediate_size);
+            } else {
+                println!("MLP interm   : {}", tc.intermediate_size);
+            }
+
+            let sliding_count = tc.layer_types.iter().filter(|t| t.as_str() == "sliding_attention").count();
+            let full_count = tc.layer_types.len() - sliding_count;
+            println!("Layer pattern: {} sliding, {} full attention", sliding_count, full_count);
+
             Ok(())
         }
     }
