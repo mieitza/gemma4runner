@@ -21,6 +21,8 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(default)]
     pub presence_penalty: Option<f64>,
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 fn default_temperature() -> Option<f64> { Some(1.0) }
@@ -44,3 +46,28 @@ pub struct ChatChoice {
 
 #[derive(Debug, Serialize)]
 pub struct ChoiceMessage { pub role: String, pub content: String }
+
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkChoice {
+    pub index: usize,
+    pub delta: ChunkDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}

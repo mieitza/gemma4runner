@@ -2,7 +2,8 @@ use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
 use axum::Json;
-use axum::response::IntoResponse;
+use axum::response::sse::{KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 
 use gemma4_core::chat_template::ChatMessage;
 use gemma4_core::engine::{EngineHandle, FinishReason, InferenceEvent, InferenceInput, InferenceRequest};
@@ -11,11 +12,12 @@ use gemma4_core::sampling::SamplingParams;
 use crate::types::chat::*;
 use crate::types::common;
 use crate::types::error::ApiError;
+use crate::streaming::inference_event_stream;
 
 pub async fn chat_completions(
     State(engine): State<EngineHandle>,
     Json(request): Json<ChatCompletionRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty", Some("messages".into())));
     }
@@ -44,34 +46,44 @@ pub async fn chat_completions(
     let model_name = request.model.clone();
     let (response_tx, response_rx) = mpsc::channel();
 
-    let inference_request = InferenceRequest { id: request_id.clone(), input: InferenceInput::Chat(messages), sampling, response_tx };
+    let inference_request = InferenceRequest {
+        id: request_id.clone(),
+        input: InferenceInput::Chat(messages),
+        sampling,
+        response_tx,
+    };
     engine.send(inference_request).map_err(|e| ApiError::service_unavailable(e.to_string()))?;
 
-    let result = tokio::task::spawn_blocking(move || collect_response(response_rx))
-        .await
-        .map_err(|e| ApiError::internal(format!("Task join error: {}", e)))?
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if request.stream.unwrap_or(false) {
+        let stream = inference_event_stream(response_rx, request_id, model_name);
+        Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+    } else {
+        let result = tokio::task::spawn_blocking(move || collect_response(response_rx))
+            .await
+            .map_err(|e| ApiError::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    let response = ChatCompletionResponse {
-        id: request_id,
-        object: "chat.completion".into(),
-        created,
-        model: model_name,
-        choices: vec![ChatChoice {
-            index: 0,
-            message: ChoiceMessage { role: "assistant".into(), content: result.content },
-            finish_reason: result.finish_reason,
-        }],
-        usage: common::Usage {
-            prompt_tokens: result.usage.prompt_tokens,
-            completion_tokens: result.usage.completion_tokens,
-            total_tokens: result.usage.prompt_tokens + result.usage.completion_tokens,
-        },
-    };
+        let response = ChatCompletionResponse {
+            id: request_id,
+            object: "chat.completion".into(),
+            created,
+            model: model_name,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChoiceMessage { role: "assistant".into(), content: result.content },
+                finish_reason: result.finish_reason,
+            }],
+            usage: common::Usage {
+                prompt_tokens: result.usage.prompt_tokens,
+                completion_tokens: result.usage.completion_tokens,
+                total_tokens: result.usage.prompt_tokens + result.usage.completion_tokens,
+            },
+        };
 
-    Ok(Json(response))
+        Ok(Json(response).into_response())
+    }
 }
 
 struct CollectedResponse {
