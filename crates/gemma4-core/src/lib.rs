@@ -7,6 +7,8 @@ pub mod mlp;
 pub mod moe;
 pub mod attention;
 pub mod model;
+pub mod quantized_model;
+pub mod gguf_loader;
 pub mod loader;
 pub mod tokenizer;
 pub mod engine;
