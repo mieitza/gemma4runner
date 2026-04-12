@@ -38,7 +38,7 @@ fn test_serialize_response() {
         created: 1234567890, model: "gemma-4-e4b".into(),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChoiceMessage { role: "assistant".into(), content: "Hello!".into() },
+            message: ChoiceMessage { role: "assistant".into(), content: Some("Hello!".into()), thinking: None, tool_calls: None },
             finish_reason: FinishReason::Stop,
         }],
         usage: Usage { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },

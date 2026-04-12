@@ -27,8 +27,11 @@ pub async fn chat_completions(
             common::Role::System => "system".into(),
             common::Role::User => "user".into(),
             common::Role::Assistant => "assistant".into(),
+            common::Role::Tool => "tool".into(),
         },
-        content: m.content.clone(),
+        content: m.content.clone().unwrap_or_default(),
+        tool_calls: None,
+        tool_call_id: None,
     }).collect();
 
     let sampling = SamplingParams {
@@ -72,7 +75,7 @@ pub async fn chat_completions(
             model: model_name,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChoiceMessage { role: "assistant".into(), content: result.content },
+                message: ChoiceMessage { role: "assistant".into(), content: Some(result.content), thinking: None, tool_calls: None },
                 finish_reason: result.finish_reason,
             }],
             usage: common::Usage {

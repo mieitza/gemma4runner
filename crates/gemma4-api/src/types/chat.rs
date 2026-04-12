@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use super::common::{FinishReason, Message, Usage};
+use super::common;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -23,6 +24,12 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f64>,
     #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<common::Tool>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub include_thinking: Option<bool>,
 }
 
 fn default_temperature() -> Option<f64> { Some(1.0) }
@@ -45,7 +52,14 @@ pub struct ChatChoice {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChoiceMessage { pub role: String, pub content: String }
+pub struct ChoiceMessage {
+    pub role: String,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<common::ToolCall>>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionChunk {
