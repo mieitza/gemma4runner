@@ -79,6 +79,11 @@ fn download_from_hub(model_id: &str, token: Option<&str>) -> Result<PathBuf> {
     Ok(model_dir)
 }
 
+/// Detect whether a model path is a GGUF file or a safetensors directory.
+pub fn is_gguf_file(path: &Path) -> bool {
+    path.is_file() && path.extension().map(|e| e == "gguf").unwrap_or(false)
+}
+
 fn find_safetensor_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
