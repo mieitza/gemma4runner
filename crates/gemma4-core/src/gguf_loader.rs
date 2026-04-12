@@ -132,5 +132,11 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         top_k_experts: get_u32(&["gemma4.expert_used_count"]),
         moe_intermediate_size: get_u32(&["gemma4.expert_feed_forward_length"]),
         num_global_key_value_heads: get_u32(&["gemma4.attention.global_head_count_kv"]),
+        hidden_size_per_layer_input: get_u32(&["gemma4.embedding_length_per_layer_input"]).unwrap_or(0),
+        vocab_size_per_layer_input: if get_u32(&["gemma4.embedding_length_per_layer_input"]).unwrap_or(0) > 0 {
+            Some(vocab_size)
+        } else {
+            None
+        },
     })
 }

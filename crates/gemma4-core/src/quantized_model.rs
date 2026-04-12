@@ -71,6 +71,74 @@ impl QLinear {
 }
 
 // ---------------------------------------------------------------------------
+// PleGlobal — per-layer embedding global precomputation
+// ---------------------------------------------------------------------------
+
+struct PleGlobal {
+    token_embd: Tensor,    // dequantized [vocab_size, num_layers * ple_dim]
+    model_proj: QLinear,   // [num_layers * ple_dim, hidden_size]
+    proj_norm: QRmsNorm,   // [ple_dim]
+    ple_dim: usize,
+    num_layers: usize,
+    hidden_size: usize,
+}
+
+impl PleGlobal {
+    fn new(cfg: &Gemma4TextConfig, loader: &dyn TensorLoader, device: &Device) -> Result<Option<Self>> {
+        if cfg.hidden_size_per_layer_input == 0 {
+            return Ok(None);
+        }
+        let ple_dim = cfg.hidden_size_per_layer_input;
+
+        let token_embd = loader.load("per_layer_token_embd.weight", device)?
+            .dequantize(device)?;
+        let model_proj = QLinear::new(loader.load("per_layer_model_proj.weight", device)?)?;
+        let proj_norm = QRmsNorm::new(
+            loader.load("per_layer_proj_norm.weight", device)?,
+            cfg.rms_norm_eps,
+            device,
+        )?;
+
+        Ok(Some(Self {
+            token_embd,
+            model_proj,
+            proj_norm,
+            ple_dim,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+        }))
+    }
+
+    /// Precompute per-layer inputs from input_ids and the main embedding.
+    /// Returns tensor of shape [batch, seq_len, num_layers, ple_dim]
+    fn precompute(&self, input_ids: &Tensor, inputs_embeds: &Tensor) -> Result<Tensor> {
+        let (batch_size, seq_len) = input_ids.dims2()?;
+
+        // Token identity signal: embed through per-layer table
+        let embed = candle_nn::Embedding::new(self.token_embd.clone(), self.ple_dim * self.num_layers);
+        let per_layer_tok = embed.forward(input_ids)?; // [batch, seq, num_layers * ple_dim]
+        let scale = (self.ple_dim as f64).sqrt();
+        let per_layer_tok = (per_layer_tok * scale)?;
+        let per_layer_tok = per_layer_tok.reshape((batch_size, seq_len, self.num_layers, self.ple_dim))?;
+
+        // Contextual signal: project main embedding
+        let per_layer_proj = self.model_proj.forward(inputs_embeds)?; // [batch, seq, num_layers * ple_dim]
+        let proj_scale = (self.hidden_size as f64).powf(-0.5);
+        let per_layer_proj = (per_layer_proj * proj_scale)?;
+        let per_layer_proj = per_layer_proj.reshape((batch_size * seq_len * self.num_layers, self.ple_dim))?;
+        let per_layer_proj = self.proj_norm.forward(&per_layer_proj)?;
+        let per_layer_proj = per_layer_proj.reshape((batch_size, seq_len, self.num_layers, self.ple_dim))?;
+
+        // Combine: (tok + proj) * 1/sqrt(2)
+        let combined = (per_layer_tok + per_layer_proj)?;
+        let input_scale = (2.0f64).powf(-0.5);
+        let combined = (combined * input_scale)?;
+
+        Ok(combined) // [batch, seq_len, num_layers, ple_dim]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QGemmaMlp — gate/up/down projections using QLinear
 // ---------------------------------------------------------------------------
 
@@ -229,6 +297,11 @@ struct QDecoderLayer {
     post_attention_layernorm: QRmsNorm,
     pre_feedforward_layernorm: QRmsNorm,
     post_feedforward_layernorm: QRmsNorm,
+    // PLE fields (optional, only for E4B/E2B)
+    ple_gate: Option<QLinear>,          // inp_gate: [ple_dim, hidden_size]
+    ple_proj: Option<QLinear>,          // proj: [hidden_size, ple_dim]
+    ple_post_norm: Option<QRmsNorm>,    // post_norm
+    layer_output_scale: Option<Tensor>, // [1] scalar
 }
 
 impl QDecoderLayer {
@@ -242,6 +315,21 @@ impl QDecoderLayer {
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let eps = cfg.rms_norm_eps;
+
+        let (ple_gate, ple_proj, ple_post_norm, layer_output_scale) = if cfg.hidden_size_per_layer_input > 0 {
+            let gate = QLinear::new(loader.load(&format!("{prefix}.inp_gate.weight"), device)?)?;
+            let proj = QLinear::new(loader.load(&format!("{prefix}.proj.weight"), device)?)?;
+            let post_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.post_norm.weight"), device)?,
+                eps, device,
+            )?;
+            let scale = loader.load(&format!("{prefix}.layer_output_scale.weight"), device)?
+                .dequantize(device)?;
+            (Some(gate), Some(proj), Some(post_norm), Some(scale))
+        } else {
+            (None, None, None, None)
+        };
+
         Ok(Self {
             self_attn: QGemmaAttention::new(
                 cfg, layer_idx,
@@ -265,6 +353,10 @@ impl QDecoderLayer {
                 loader.load(&format!("{prefix}.post_ffw_norm.weight"), device)?,
                 eps, device,
             )?,
+            ple_gate,
+            ple_proj,
+            ple_post_norm,
+            layer_output_scale,
         })
     }
 
@@ -274,6 +366,7 @@ impl QDecoderLayer {
         mask: Option<&Tensor>,
         cache: &mut crate::kv_cache::LayerKvCache,
         seqlen_offset: usize,
+        per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
         // Attention sub-layer with pre/post norm and residual
         let residual = x;
@@ -287,7 +380,25 @@ impl QDecoderLayer {
         let ff = self.pre_feedforward_layernorm.forward(&x)?;
         let ff = self.mlp.forward(&ff)?;
         let ff = self.post_feedforward_layernorm.forward(&ff)?;
-        Ok((residual + ff)?)
+        let x = (residual + ff)?;
+
+        // PLE sub-block (only active for E4B/E2B when per_layer_input is provided)
+        let x = if let (Some(gate), Some(proj), Some(post_norm), Some(scale), Some(ple_input)) =
+            (&self.ple_gate, &self.ple_proj, &self.ple_post_norm, &self.layer_output_scale, per_layer_input)
+        {
+            let residual = &x;
+            let gated = gate.forward(&x)?;                                          // [batch, seq, ple_dim]
+            let gated = candle_nn::Activation::GeluPytorchTanh.forward(&gated)?;
+            let gated = (gated * ple_input)?;                                       // element-wise multiply
+            let projected = proj.forward(&gated)?;                                  // [batch, seq, hidden_size]
+            let normed = post_norm.forward(&projected)?;
+            let x = (residual + normed)?;
+            x.broadcast_mul(scale)?
+        } else {
+            x
+        };
+
+        Ok(x)
     }
 }
 
@@ -307,6 +418,8 @@ pub struct QuantizedGemmaModel {
     final_logit_softcapping: Option<f64>,
     hidden_size: usize,
     cfg: Gemma4TextConfig,
+    /// Per-Layer Embeddings global state (E4B/E2B only).
+    ple: Option<PleGlobal>,
 }
 
 impl QuantizedGemmaModel {
@@ -365,6 +478,8 @@ impl QuantizedGemmaModel {
             QMatMul::from_qtensor(loader.load("output.weight", device)?)?
         };
 
+        let ple = PleGlobal::new(cfg, loader, device)?;
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -373,6 +488,7 @@ impl QuantizedGemmaModel {
             final_logit_softcapping: cfg.final_logit_softcapping,
             hidden_size: cfg.hidden_size,
             cfg: cfg.clone(),
+            ple,
         })
     }
 
@@ -390,16 +506,25 @@ impl QuantizedGemmaModel {
         let scale = (self.hidden_size as f64).sqrt();
         x = (x * scale)?;
 
+        // PLE global precomputation (E4B/E2B only)
+        let per_layer_inputs = match &self.ple {
+            Some(ple) => Some(ple.precompute(input_ids, &x)?),
+            None => None,
+        };
+
         let (sliding_mask, global_mask) =
             self.create_masks(seq_len, seqlen_offset, x.device())?;
 
         for (i, layer) in self.layers.iter().enumerate() {
+            let ple_input = per_layer_inputs.as_ref().map(|pli| {
+                pli.narrow(2, i, 1).unwrap().squeeze(2).unwrap() // [batch, seq, ple_dim]
+            });
             let mask = if self.cfg.is_sliding_layer(i) {
                 sliding_mask.as_ref()
             } else {
                 global_mask.as_ref()
             };
-            x = layer.forward(&x, mask, cache.layer_mut(i), seqlen_offset)?;
+            x = layer.forward(&x, mask, cache.layer_mut(i), seqlen_offset, ple_input.as_ref())?;
         }
 
         // Take only the last token's hidden state for decoding

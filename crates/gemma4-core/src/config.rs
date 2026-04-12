@@ -48,6 +48,10 @@ pub struct Gemma4TextConfig {
     pub moe_intermediate_size: Option<usize>,
     #[serde(default)]
     pub num_global_key_value_heads: Option<usize>,
+    #[serde(default)]
+    pub hidden_size_per_layer_input: usize,
+    #[serde(default)]
+    pub vocab_size_per_layer_input: Option<usize>,
 }
 
 impl Gemma4TextConfig {
