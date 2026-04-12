@@ -5,7 +5,7 @@ use axum::Json;
 use axum::response::IntoResponse;
 
 use gemma4_core::chat_template::ChatMessage;
-use gemma4_core::engine::{EngineHandle, FinishReason, InferenceEvent, InferenceRequest};
+use gemma4_core::engine::{EngineHandle, FinishReason, InferenceEvent, InferenceInput, InferenceRequest};
 use gemma4_core::sampling::SamplingParams;
 
 use crate::types::chat::*;
@@ -44,7 +44,7 @@ pub async fn chat_completions(
     let model_name = request.model.clone();
     let (response_tx, response_rx) = mpsc::channel();
 
-    let inference_request = InferenceRequest { id: request_id.clone(), messages, sampling, response_tx };
+    let inference_request = InferenceRequest { id: request_id.clone(), input: InferenceInput::Chat(messages), sampling, response_tx };
     engine.send(inference_request).map_err(|e| ApiError::service_unavailable(e.to_string()))?;
 
     let result = tokio::task::spawn_blocking(move || collect_response(response_rx))
