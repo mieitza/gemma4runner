@@ -16,6 +16,8 @@ struct DecoderLayer {
     post_attention_layernorm: candle_nn::RmsNorm,
     pre_feedforward_layernorm: candle_nn::RmsNorm,
     post_feedforward_layernorm: candle_nn::RmsNorm,
+    moe_block: Option<crate::moe::MoeBlock>,
+    post_feedforward_layernorm_1: Option<candle_nn::RmsNorm>,
 }
 
 impl DecoderLayer {
@@ -29,12 +31,31 @@ impl DecoderLayer {
         let mlp = GemmaMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
         let eps = cfg.rms_norm_eps;
         let hs = cfg.hidden_size;
+        let (moe_block, post_feedforward_layernorm_1) = if cfg.enable_moe_block {
+            let moe = crate::moe::MoeBlock::new(
+                cfg.hidden_size,
+                cfg.moe_intermediate_size.unwrap_or(704),
+                cfg.num_experts.unwrap_or(128),
+                cfg.top_k_experts.unwrap_or(8),
+                cfg.rms_norm_eps,
+                vb.clone(),
+            )?;
+            let post_ff_1 = candle_nn::rms_norm(
+                cfg.hidden_size, cfg.rms_norm_eps,
+                vb.pp("post_feedforward_layernorm_1"),
+            )?;
+            (Some(moe), Some(post_ff_1))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             self_attn, mlp,
             input_layernorm: candle_nn::rms_norm(hs, eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: candle_nn::rms_norm(hs, eps, vb.pp("post_attention_layernorm"))?,
             pre_feedforward_layernorm: candle_nn::rms_norm(hs, eps, vb.pp("pre_feedforward_layernorm"))?,
             post_feedforward_layernorm: candle_nn::rms_norm(hs, eps, vb.pp("post_feedforward_layernorm"))?,
+            moe_block,
+            post_feedforward_layernorm_1,
         })
     }
 
@@ -48,6 +69,15 @@ impl DecoderLayer {
         let residual = &x;
         let ff = self.pre_feedforward_layernorm.forward(&x)?;
         let ff = self.mlp.forward(&ff)?;
+
+        let ff = if let (Some(moe), Some(post_ff_1)) = (&self.moe_block, &self.post_feedforward_layernorm_1) {
+            let dense_normed = post_ff_1.forward(&ff)?;
+            let moe_output = moe.forward(residual)?;
+            (dense_normed + moe_output)?
+        } else {
+            ff
+        };
+
         let ff = self.post_feedforward_layernorm.forward(&ff)?;
         let x = (residual + ff)?;
         Ok(x)
