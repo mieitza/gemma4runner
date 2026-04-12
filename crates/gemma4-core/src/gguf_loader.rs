@@ -88,7 +88,12 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         .unwrap_or(hidden_size * 4);
     let vocab_size = get_u32(&["gemma4.vocab_size", "tokenizer.ggml.tokens"])
         .unwrap_or(262144);
-    let head_dim = get_u32(&["gemma4.attention.key_length"]).unwrap_or(256);
+    // GGUF key_length is the GLOBAL head dim (512 for E4B).
+    // The sliding head_dim is typically 256 for all Gemma 4 models.
+    // We derive it: if key_length > 256, the global_head_dim = key_length, head_dim = 256.
+    let key_length = get_u32(&["gemma4.attention.key_length"]).unwrap_or(256);
+    let head_dim = if key_length > 256 { 256 } else { key_length };
+    let global_head_dim = if key_length > 256 { key_length } else { 512 };
     let rms_norm_eps = get_f64(&["gemma4.attention.layer_norm_rms_epsilon"]).unwrap_or(1e-6);
     let sliding_window = get_u32(&["gemma4.attention.sliding_window"]).unwrap_or(512);
     let max_position_embeddings = get_u32(&["gemma4.context_length"]).unwrap_or(131072);
@@ -113,7 +118,7 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         num_hidden_layers,
         num_key_value_heads,
         head_dim,
-        global_head_dim: get_u32(&["gemma4.attention.global_key_length"]).unwrap_or(512),
+        global_head_dim,
         rms_norm_eps,
         vocab_size,
         max_position_embeddings,

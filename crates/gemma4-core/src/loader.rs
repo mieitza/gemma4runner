@@ -84,6 +84,20 @@ pub fn is_gguf_file(path: &Path) -> bool {
     path.is_file() && path.extension().map(|e| e == "gguf").unwrap_or(false)
 }
 
+/// Download just the tokenizer.json from a HuggingFace model.
+/// Used when loading GGUF files that don't include a separate tokenizer.
+pub fn download_tokenizer(model_id: &str, token: Option<&str>) -> Result<PathBuf> {
+    let mut builder = hf_hub::api::sync::ApiBuilder::new();
+    if let Some(token) = token {
+        builder = builder.with_token(Some(token.to_string()));
+    }
+    let api = builder.build()?;
+    let repo = api.model(model_id.to_string());
+    let path = repo.get("tokenizer.json")
+        .map_err(|e| anyhow::anyhow!("Failed to download tokenizer.json: {}", e))?;
+    Ok(path)
+}
+
 fn find_safetensor_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())

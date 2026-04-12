@@ -45,12 +45,20 @@ async fn main() -> Result<()> {
         }
         Commands::Info { model, hf_token } => {
             let model_path = gemma4_core::loader::resolve_model_source(&model, hf_token.as_deref())?;
-            let config_path = model_path.join("config.json");
-            let config: gemma4_core::config::Gemma4Config = serde_json::from_reader(
-                fs::File::open(&config_path)
-                    .with_context(|| format!("Failed to open {}", config_path.display()))?,
-            ).context("Failed to parse config.json")?;
-            let tc = &config.text_config;
+
+            // Load config — handle both GGUF files and safetensors directories
+            let tc = if gemma4_core::loader::is_gguf_file(&model_path) {
+                let gguf = gemma4_core::gguf_loader::GgufModel::load(&model_path, &candle_core::Device::Cpu)?;
+                gguf.config
+            } else {
+                let config_path = model_path.join("config.json");
+                let config: gemma4_core::config::Gemma4Config = serde_json::from_reader(
+                    fs::File::open(&config_path)
+                        .with_context(|| format!("Failed to open {}", config_path.display()))?,
+                ).context("Failed to parse config.json")?;
+                config.text_config
+            };
+            let tc = &tc;
 
             println!("Model source : {}", model_path.display());
             println!("Hidden size  : {}", tc.hidden_size);

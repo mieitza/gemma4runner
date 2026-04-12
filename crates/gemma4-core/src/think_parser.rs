@@ -193,9 +193,14 @@ fn find_or_prefix(haystack: &str, needle: &str) -> TagSearch {
 
     // Check whether any suffix of `haystack` is a prefix of `needle`.
     // We walk from the longest possible overlap down to 1.
+    // Only slice at valid UTF-8 char boundaries to avoid panics on multi-byte chars.
     let max_overlap = needle.len().min(haystack.len());
     for overlap in (1..=max_overlap).rev() {
-        let haystack_tail = &haystack[haystack.len() - overlap..];
+        let start = haystack.len() - overlap;
+        if !haystack.is_char_boundary(start) || !needle.is_char_boundary(overlap) {
+            continue;
+        }
+        let haystack_tail = &haystack[start..];
         let needle_head = &needle[..overlap];
         if haystack_tail == needle_head {
             return TagSearch::Prefix(overlap);

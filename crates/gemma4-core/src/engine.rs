@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 
 use crate::chat_template::ChatMessage;
@@ -127,10 +127,18 @@ pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Re
         let gguf = crate::gguf_loader::GgufModel::load(model_path, &device)?;
         let text_config = gguf.config.clone();
 
-        // Tokenizer must be alongside the GGUF file (same directory)
+        // Try to find tokenizer.json alongside the GGUF file
         let tokenizer_path = model_path.parent()
             .unwrap_or(Path::new("."))
             .join("tokenizer.json");
+        let tokenizer_path = if tokenizer_path.exists() {
+            tokenizer_path
+        } else {
+            // Download tokenizer from HuggingFace (Gemma 4 E4B base model)
+            tracing::info!("Tokenizer not found locally, downloading from HuggingFace...");
+            loader::download_tokenizer("google/gemma-4-E4B-it", None)
+                .context("Failed to download tokenizer. Place a tokenizer.json next to the GGUF file or ensure network access.")?
+        };
         let eos_ids = vec![1u32, 106]; // <eos> and <turn|>
         let tokenizer = GemmaTokenizer::from_file(&tokenizer_path, eos_ids.clone())?;
 
