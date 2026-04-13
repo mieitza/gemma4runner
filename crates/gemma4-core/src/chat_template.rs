@@ -136,13 +136,8 @@ pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatF
         }
     }
 
-    // Begin generation turn
+    // Begin generation turn (matches GGUF chat template: just "<|turn>model\n")
     prompt.push_str("<|turn>model\n");
-
-    // If thinking is disabled, suppress the thought channel
-    if !options.enable_thinking {
-        prompt.push_str("<|channel>thought\n<channel|>");
-    }
 
     prompt
 }
@@ -161,7 +156,7 @@ mod tests {
         let prompt = format_chat_prompt(&messages);
         assert!(prompt.starts_with("<bos>"));
         assert!(prompt.contains("<|turn>user\nHello<turn|>"));
-        assert!(prompt.ends_with("<|turn>model\n<|channel>thought\n<channel|>"));
+        assert!(prompt.ends_with("<|turn>model\n"));
     }
 
     #[test]
@@ -214,9 +209,11 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_disabled_suppresses() {
+    fn test_thinking_disabled_no_suppression_tokens() {
         let messages = vec![ChatMessage { role: "user".into(), content: "Hi".into(), tool_calls: None, tool_call_id: None }];
         let prompt = format_chat_prompt_with_options(&messages, &ChatFormatOptions::default());
-        assert!(prompt.ends_with("<|channel>thought\n<channel|>"));
+        // Matches GGUF chat template: no thinking suppression tokens appended
+        assert!(prompt.ends_with("<|turn>model\n"));
+        assert!(!prompt.contains("<|channel>"));
     }
 }
