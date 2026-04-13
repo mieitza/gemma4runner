@@ -1,12 +1,18 @@
+//! Quantized Gemma 4 model implementation.
+//!
+//! Closely follows the patterns from candle-transformers' `quantized_gemma3.rs`
+//! (which works correctly with GGUF files) with minimal adaptations for Gemma 4
+//! differences: GeluPytorchTanh activation, per-layer head dimensions, per-layer
+//! RoPE, logit softcapping, and PLE support.
+
 use std::sync::Arc;
 use anyhow::Result;
-use candle_core::{Device, DType, Tensor, D};
+use candle_core::{Device, DType, IndexOp, Tensor, D};
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_nn::Module;
 
 use crate::config::Gemma4TextConfig;
 use crate::kv_cache::KvCache;
-use crate::rope::{ProportionalRotaryEmbedding, RotaryEmbedding};
 
 // ---------------------------------------------------------------------------
 // TensorLoader trait
@@ -30,48 +36,42 @@ pub trait TensorLoader {
 
 struct QRmsNorm {
     weight: Tensor,
-    eps: f64,
+    eps: f32,
 }
 
 impl QRmsNorm {
     fn new(qtensor: QTensor, eps: f64, device: &Device) -> Result<Self> {
         let weight = qtensor.dequantize(device)?;
-        Ok(Self { weight, eps })
+        Ok(Self { weight, eps: eps as f32 })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = (&x_f32 * &x_f32)?.mean_keepdim(D::Minus1)?;
-        let x_norm = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let weight = self.weight.to_dtype(DType::F32)?;
-        let result = x_norm.broadcast_mul(&weight)?;
-        Ok(result.to_dtype(dtype)?)
+        candle_nn::ops::rms_norm(x, &self.weight, self.eps).map_err(Into::into)
     }
 }
 
 // ---------------------------------------------------------------------------
-// QLinear — wraps QMatMul
+// QLinear — wraps QMatMul (matches QMatMul in quantized_gemma3.rs)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct QLinear {
-    weight: QMatMul,
+    inner: QMatMul,
 }
 
 impl QLinear {
-    fn new(qtensor: QTensor) -> Result<Self> {
-        Ok(Self {
-            weight: QMatMul::from_qtensor(qtensor)?,
-        })
+    fn from_qtensor(qtensor: QTensor) -> Result<Self> {
+        let inner = QMatMul::from_qtensor(qtensor)?;
+        Ok(Self { inner })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.weight.forward(x)?)
+        Ok(self.inner.forward(x)?)
     }
 }
 
 // ---------------------------------------------------------------------------
-// PleGlobal — per-layer embedding global precomputation
+// PleGlobal — per-layer embedding global precomputation (E4B/E2B only)
 // ---------------------------------------------------------------------------
 
 struct PleGlobal {
@@ -92,7 +92,7 @@ impl PleGlobal {
 
         let token_embd = loader.load("per_layer_token_embd.weight", device)?
             .dequantize(device)?;
-        let model_proj = QLinear::new(loader.load("per_layer_model_proj.weight", device)?)?;
+        let model_proj = QLinear::from_qtensor(loader.load("per_layer_model_proj.weight", device)?)?;
         let proj_norm = QRmsNorm::new(
             loader.load("per_layer_proj_norm.weight", device)?,
             cfg.rms_norm_eps,
@@ -139,266 +139,273 @@ impl PleGlobal {
 }
 
 // ---------------------------------------------------------------------------
-// QGemmaMlp — gate/up/down projections using QLinear
+// RotaryEmbedding — follows quantized_gemma3.rs exactly
 // ---------------------------------------------------------------------------
 
-struct QGemmaMlp {
-    gate_proj: QLinear,
-    up_proj: QLinear,
-    down_proj: QLinear,
+const MAX_SEQ_LEN: usize = 131072;
+
+#[derive(Debug, Clone)]
+struct RotaryEmbedding {
+    sin: Tensor,
+    cos: Tensor,
 }
 
-impl QGemmaMlp {
-    fn new(loader: &dyn TensorLoader, prefix: &str, device: &Device) -> Result<Self> {
-        Ok(Self {
-            gate_proj: QLinear::new(loader.load(&format!("{prefix}.ffn_gate.weight"), device)?)?,
-            up_proj:   QLinear::new(loader.load(&format!("{prefix}.ffn_up.weight"),   device)?)?,
-            down_proj: QLinear::new(loader.load(&format!("{prefix}.ffn_down.weight"), device)?)?,
-        })
+impl RotaryEmbedding {
+    fn new(head_dim: usize, rope_frequency: f32, device: &Device) -> Result<Self> {
+        let theta: Vec<_> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / rope_frequency.powf(i as f32 / head_dim as f32))
+            .collect();
+        let theta = Tensor::new(theta.as_slice(), device)?;
+        let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((MAX_SEQ_LEN, 1))?
+            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+        let cos = idx_theta.cos()?;
+        let sin = idx_theta.sin()?;
+        Ok(Self { sin, cos })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
-        let up = self.up_proj.forward(x)?;
-        let fused = (gate * up)?;
-        self.down_proj.forward(&fused)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// QGemmaAttention — same as attention.rs but with QLinear / QRmsNorm
-// ---------------------------------------------------------------------------
-
-struct QGemmaAttention {
-    q_proj: QLinear,
-    k_proj: QLinear,
-    v_proj: QLinear,
-    o_proj: QLinear,
-    q_norm: QRmsNorm,
-    k_norm: QRmsNorm,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    is_sliding: bool,
-    rotary_emb_local: Arc<RotaryEmbedding>,
-    rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
-}
-
-impl QGemmaAttention {
-    fn new(
-        cfg: &Gemma4TextConfig,
-        layer_idx: usize,
-        rotary_emb_local: Arc<RotaryEmbedding>,
-        rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
-        loader: &dyn TensorLoader,
-        prefix: &str,
-        device: &Device,
-    ) -> Result<Self> {
-        let is_sliding = cfg.is_sliding_layer(layer_idx);
-        let head_dim = cfg.head_dim_for_layer(layer_idx);
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.kv_heads_for_layer(layer_idx);
-
-        Ok(Self {
-            q_proj: QLinear::new(loader.load(&format!("{prefix}.attn_q.weight"),      device)?)?,
-            k_proj: QLinear::new(loader.load(&format!("{prefix}.attn_k.weight"),      device)?)?,
-            v_proj: QLinear::new(loader.load(&format!("{prefix}.attn_v.weight"),      device)?)?,
-            o_proj: QLinear::new(loader.load(&format!("{prefix}.attn_output.weight"), device)?)?,
-            q_norm: QRmsNorm::new(loader.load(&format!("{prefix}.attn_q_norm.weight"), device)?, cfg.rms_norm_eps, device)?,
-            k_norm: QRmsNorm::new(loader.load(&format!("{prefix}.attn_k_norm.weight"), device)?, cfg.rms_norm_eps, device)?,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups: num_heads / num_kv_heads,
-            head_dim,
-            is_sliding,
-            rotary_emb_local,
-            rotary_emb_global,
-        })
+    /// Partial RoPE: only rotate the first `rotary_dim` dimensions, pass through the rest.
+    fn new_partial(head_dim: usize, partial_rotary_factor: f64, rope_frequency: f32, device: &Device) -> Result<(Self, usize)> {
+        let rotary_dim = ((head_dim as f64 * partial_rotary_factor) as usize) & !1; // ensure even
+        let emb = Self::new(rotary_dim, rope_frequency, device)?;
+        Ok((emb, rotary_dim))
     }
 
-    fn forward(
+    fn apply_rotary_emb_qkv(
         &self,
+        q: &Tensor,
+        k: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        let cos = self.cos.narrow(0, index_pos, seq_len)?;
+        let sin = self.sin.narrow(0, index_pos, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        Ok((q_embed, k_embed))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mlp — GeluPytorchTanh for Gemma 4 (vs SiLU for Gemma 3)
+// ---------------------------------------------------------------------------
+
+struct Mlp {
+    feed_forward_gate: QLinear,
+    feed_forward_up: QLinear,
+    feed_forward_down: QLinear,
+}
+
+impl Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.feed_forward_gate.forward(xs)?;
+        let up = self.feed_forward_up.forward(xs)?;
+        let activated = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
+        let gated = (activated * up)?;
+        self.feed_forward_down.forward(&gated)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// repeat_kv — GQA helper (same as quantized_gemma3.rs utils::repeat_kv)
+// ---------------------------------------------------------------------------
+
+fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
+    if n_rep == 1 {
+        return Ok(x);
+    }
+    let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
+    Ok(x
+        .unsqueeze(2)?
+        .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+        .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))?)
+}
+
+// ---------------------------------------------------------------------------
+// LayerWeights — follows quantized_gemma3.rs LayerWeights exactly
+// ---------------------------------------------------------------------------
+
+struct LayerWeights {
+    // Attention
+    attention_wq: QLinear,
+    attention_wk: QLinear,
+    attention_wv: QLinear,
+    attention_wo: QLinear,
+
+    // Q/K norms
+    attention_q_norm: QRmsNorm,
+    attention_k_norm: QRmsNorm,
+
+    // Layer norms (pre/post attention, pre/post FFN)
+    attention_norm: QRmsNorm,
+    post_attention_norm: QRmsNorm,
+    ffn_norm: QRmsNorm,
+    post_ffn_norm: QRmsNorm,
+
+    // MLP
+    mlp: Mlp,
+
+    // Attention geometry
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    q_dim: usize,
+
+    // Sliding window
+    sliding_window_size: Option<usize>,
+
+    // RoPE
+    rotary_embedding: Arc<RotaryEmbedding>,
+    rotary_dim: usize,  // for partial RoPE (global layers)
+
+    neg_inf: Tensor,
+
+    // KV cache
+    kv_cache: Option<(Tensor, Tensor)>,
+
+    // PLE (optional, E4B/E2B)
+    ple_gate: Option<QLinear>,
+    ple_proj: Option<QLinear>,
+    ple_post_norm: Option<QRmsNorm>,
+    layer_output_scale: Option<Tensor>,
+}
+
+impl LayerWeights {
+    fn mask(
+        &self,
+        b_sz: usize,
+        seq_len: usize,
+        index_pos: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        // Build mask as u32 (1 = attend, 0 = mask out) — matches gemma3 pattern
+        let mask: Vec<_> = if let Some(sliding_window_size) = self.sliding_window_size {
+            (0..seq_len)
+                .flat_map(|i| {
+                    (0..seq_len).map(move |j| {
+                        if i < j || j + sliding_window_size < i {
+                            0u32
+                        } else {
+                            1u32
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            (0..seq_len)
+                .flat_map(|i| (0..seq_len).map(move |j| if i < j { 0u32 } else { 1u32 }))
+                .collect()
+        };
+        let mask = Tensor::from_slice(&mask, (seq_len, seq_len), device)?;
+        // For cached tokens, prepend zeros (allow attending to all cached positions)
+        let mask = if index_pos > 0 {
+            let mask0 = Tensor::zeros((seq_len, index_pos), DType::U32, device)?;
+            Tensor::cat(&[&mask0, &mask], D::Minus1)?
+        } else {
+            mask
+        };
+        mask.expand((b_sz, 1, seq_len, seq_len + index_pos))?
+            .to_dtype(DType::U32)
+            .map_err(Into::into)
+    }
+
+    fn forward_attn(
+        &mut self,
         x: &Tensor,
         mask: Option<&Tensor>,
-        cache: &mut crate::kv_cache::LayerKvCache,
-        seqlen_offset: usize,
+        index_pos: usize,
     ) -> Result<Tensor> {
-        let (batch_size, seq_len, _) = x.dims3()?;
+        let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self.attention_wq.forward(x)?;
+        let k = self.attention_wk.forward(x)?;
+        let v = self.attention_wv.forward(x)?;
 
-        let q = q.reshape((batch_size, seq_len, self.num_heads,    self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
 
-        // Per-head RMS norm
-        let q = self.apply_head_norm(&q, &self.q_norm)?;
-        let k = self.apply_head_norm(&k, &self.k_norm)?;
+        // Per-head Q/K norms — .contiguous() before norm (critical, line 203-204 in gemma3)
+        let q = self.attention_q_norm.forward(&q.contiguous()?)?;
+        let k = self.attention_k_norm.forward(&k.contiguous()?)?;
 
-        // RoPE
-        let (q, k) = if self.is_sliding {
-            self.rotary_emb_local.apply(&q, &k, seqlen_offset)?
+        // RoPE — handle partial rotation for global layers
+        let (q, k) = if self.rotary_dim < self.head_dim {
+            let q_rot = q.narrow(D::Minus1, 0, self.rotary_dim)?;
+            let q_pass = q.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?;
+            let k_rot = k.narrow(D::Minus1, 0, self.rotary_dim)?;
+            let k_pass = k.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?;
+            let (q_rot, k_rot) = self.rotary_embedding.apply_rotary_emb_qkv(&q_rot, &k_rot, index_pos)?;
+            (
+                Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?,
+                Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?,
+            )
         } else {
-            self.rotary_emb_global.apply(&q, &k, seqlen_offset)?
+            self.rotary_embedding.apply_rotary_emb_qkv(&q, &k, index_pos)?
         };
 
         // KV cache
-        let (k, v) = cache.append(&k, &v)?;
+        let (k, v) = match &self.kv_cache {
+            None => (k, v),
+            Some((k_cache, v_cache)) => {
+                if index_pos == 0 {
+                    (k, v)
+                } else {
+                    let k = Tensor::cat(&[k_cache, &k], 2)?;
+                    let v = Tensor::cat(&[v_cache, &v], 2)?;
+                    (k, v)
+                }
+            }
+        };
+
+        // Sliding window eviction
+        let (k, v) = if let Some(window) = self.sliding_window_size {
+            let kv_seq_len = k.dim(2)?;
+            if kv_seq_len > window {
+                let start = kv_seq_len - window;
+                (k.narrow(2, start, window)?, v.narrow(2, start, window)?)
+            } else {
+                (k, v)
+            }
+        } else {
+            (k, v)
+        };
+
+        self.kv_cache = Some((k.clone(), v.clone()));
 
         // Repeat KV for GQA
-        let k = self.repeat_kv(&k)?;
-        let v = self.repeat_kv(&v)?;
+        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
+        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 
         // Scaled dot-product attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let attn_weights = match mask {
-            Some(m) => attn_weights.broadcast_add(m)?,
-            None => attn_weights,
+
+        // Apply mask: eq(0u32)?.where_cond(&neg_inf, &attn_weights)?  — exact gemma3 pattern
+        let attn_weights = if let Some(mask) = mask {
+            let mask = mask.broadcast_as(attn_weights.shape())?;
+            let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
+            mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?
+        } else {
+            attn_weights
         };
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let output = attn_weights.matmul(&v)?;
-        let output = output
+
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&v)?;
+
+        let attn_output = attn_output
             .transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&output)
-    }
+            .reshape((b_sz, seq_len, self.q_dim))?;
 
-    fn apply_head_norm(&self, x: &Tensor, norm: &QRmsNorm) -> Result<Tensor> {
-        let (b, h, s, d) = x.dims4()?;
-        let x = x.reshape((b * h * s, d))?;
-        let x = norm.forward(&x)?;
-        Ok(x.reshape((b, h, s, d))?)
-    }
-
-    fn repeat_kv(&self, x: &Tensor) -> Result<Tensor> {
-        if self.num_kv_groups == 1 {
-            return Ok(x.clone());
-        }
-        let (b, h, s, d) = x.dims4()?;
-        Ok(x.unsqueeze(2)?
-            .expand((b, h, self.num_kv_groups, s, d))?
-            .reshape((b, h * self.num_kv_groups, s, d))?)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// QDecoderLayer
-// ---------------------------------------------------------------------------
-
-struct QDecoderLayer {
-    self_attn: QGemmaAttention,
-    mlp: QGemmaMlp,
-    input_layernorm: QRmsNorm,
-    post_attention_layernorm: QRmsNorm,
-    pre_feedforward_layernorm: QRmsNorm,
-    post_feedforward_layernorm: QRmsNorm,
-    // PLE fields (optional, only for E4B/E2B)
-    ple_gate: Option<QLinear>,          // inp_gate: [ple_dim, hidden_size]
-    ple_proj: Option<QLinear>,          // proj: [hidden_size, ple_dim]
-    ple_post_norm: Option<QRmsNorm>,    // post_norm
-    layer_output_scale: Option<Tensor>, // [1] scalar
-}
-
-impl QDecoderLayer {
-    fn new(
-        cfg: &Gemma4TextConfig,
-        layer_idx: usize,
-        rotary_emb_local: Arc<RotaryEmbedding>,
-        rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
-        loader: &dyn TensorLoader,
-        device: &Device,
-    ) -> Result<Self> {
-        let prefix = format!("blk.{layer_idx}");
-        let eps = cfg.rms_norm_eps;
-
-        let (ple_gate, ple_proj, ple_post_norm, layer_output_scale) = if cfg.hidden_size_per_layer_input > 0 {
-            let gate = QLinear::new(loader.load(&format!("{prefix}.inp_gate.weight"), device)?)?;
-            let proj = QLinear::new(loader.load(&format!("{prefix}.proj.weight"), device)?)?;
-            let post_norm = QRmsNorm::new(
-                loader.load(&format!("{prefix}.post_norm.weight"), device)?,
-                eps, device,
-            )?;
-            let scale = loader.load(&format!("{prefix}.layer_output_scale.weight"), device)?
-                .dequantize(device)?;
-            (Some(gate), Some(proj), Some(post_norm), Some(scale))
-        } else {
-            (None, None, None, None)
-        };
-
-        Ok(Self {
-            self_attn: QGemmaAttention::new(
-                cfg, layer_idx,
-                rotary_emb_local, rotary_emb_global,
-                loader, &prefix, device,
-            )?,
-            mlp: QGemmaMlp::new(loader, &prefix, device)?,
-            input_layernorm: QRmsNorm::new(
-                loader.load(&format!("{prefix}.attn_norm.weight"), device)?,
-                eps, device,
-            )?,
-            post_attention_layernorm: QRmsNorm::new(
-                loader.load(&format!("{prefix}.post_attention_norm.weight"), device)?,
-                eps, device,
-            )?,
-            pre_feedforward_layernorm: QRmsNorm::new(
-                loader.load(&format!("{prefix}.ffn_norm.weight"), device)?,
-                eps, device,
-            )?,
-            post_feedforward_layernorm: QRmsNorm::new(
-                loader.load(&format!("{prefix}.post_ffw_norm.weight"), device)?,
-                eps, device,
-            )?,
-            ple_gate,
-            ple_proj,
-            ple_post_norm,
-            layer_output_scale,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        cache: &mut crate::kv_cache::LayerKvCache,
-        seqlen_offset: usize,
-        per_layer_input: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        // Attention sub-layer with pre/post norm and residual
-        let residual = x;
-        let x = self.input_layernorm.forward(x)?;
-        let x = self.self_attn.forward(&x, mask, cache, seqlen_offset)?;
-        let x = self.post_attention_layernorm.forward(&x)?;
-        let x = (residual + x)?;
-
-        // Feed-forward sub-layer with pre/post norm and residual
-        let residual = &x;
-        let ff = self.pre_feedforward_layernorm.forward(&x)?;
-        let ff = self.mlp.forward(&ff)?;
-        let ff = self.post_feedforward_layernorm.forward(&ff)?;
-        let x = (residual + ff)?;
-
-        // PLE sub-block (only active for E4B/E2B when per_layer_input is provided)
-        let x = if let (Some(gate), Some(proj), Some(post_norm), Some(scale), Some(ple_input)) =
-            (&self.ple_gate, &self.ple_proj, &self.ple_post_norm, &self.layer_output_scale, per_layer_input)
-        {
-            let residual = &x;
-            let gated = gate.forward(&x)?;                                          // [batch, seq, ple_dim]
-            let gated = candle_nn::Activation::GeluPytorchTanh.forward(&gated)?;
-            let gated = (gated * ple_input)?;                                       // element-wise multiply
-            let projected = proj.forward(&gated)?;                                  // [batch, seq, hidden_size]
-            let normed = post_norm.forward(&projected)?;
-            let x = (residual + normed)?;
-            x.broadcast_mul(scale)?
-        } else {
-            x
-        };
-
-        Ok(x)
+        self.attention_wo.forward(&attn_output)
     }
 }
 
@@ -408,62 +415,53 @@ impl QDecoderLayer {
 
 /// Full Gemma4 model loaded from a GGUF file via the `TensorLoader` trait.
 pub struct QuantizedGemmaModel {
-    /// Dequantized embedding table (f32 on CPU, reused as tied lm_head).
     embed_tokens: Tensor,
-    layers: Vec<QDecoderLayer>,
+    layers: Vec<LayerWeights>,
     norm: QRmsNorm,
-    /// LM head — either `QMatMul::Tensor(embed_tokens)` (tied) or a separate
-    /// quantized projection.
     lm_head: QMatMul,
     final_logit_softcapping: Option<f64>,
     hidden_size: usize,
+    #[allow(dead_code)]
     cfg: Gemma4TextConfig,
-    /// Per-Layer Embeddings global state (E4B/E2B only).
     ple: Option<PleGlobal>,
 }
 
 impl QuantizedGemmaModel {
     /// Build from pre-loaded quantized tensors.
-    ///
-    /// In practice this is called by the engine after loading GGUF via
-    /// `GgufModel` (which implements `TensorLoader`). Any stub that implements
-    /// `TensorLoader` works too, making the type unit-testable without disk I/O.
     pub fn new(
         cfg: &Gemma4TextConfig,
         loader: &dyn TensorLoader,
         device: &Device,
     ) -> Result<Self> {
-        // Embedding — dequantize to f32 so matmul with integer token ids works.
         let embed_tokens = loader.load_dequantized("token_embd.weight", device)?;
 
-        let sliding_rope = cfg.rope_parameters.as_ref().and_then(|p| p.sliding_attention.as_ref());
-        let full_rope    = cfg.rope_parameters.as_ref().and_then(|p| p.full_attention.as_ref());
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
-        let rotary_emb_local = Arc::new(RotaryEmbedding::new(
-            DType::F32,
-            cfg.head_dim,
-            sliding_rope.and_then(|p| p.rope_theta).unwrap_or(10_000.0),
-            cfg.max_position_embeddings,
-            device,
-        )?);
-        let rotary_emb_global = Arc::new(ProportionalRotaryEmbedding::new(
-            DType::F32,
-            cfg.global_head_dim.max(cfg.head_dim), // fall back to head_dim if 0
-            full_rope.and_then(|p| p.rope_theta).unwrap_or(1_000_000.0),
-            full_rope.and_then(|p| p.partial_rotary_factor).unwrap_or(0.25),
-            cfg.max_position_embeddings,
-            device,
-        )?);
+        // Build per-layer RoPE embeddings (different head_dim and freq per layer type)
+        // Sliding layers: full rotation, local freq base
+        // Global layers: partial rotation, global freq base
+        let sliding_rope_freq = cfg.rope_parameters.as_ref()
+            .and_then(|p| p.sliding_attention.as_ref())
+            .and_then(|p| p.rope_theta)
+            .unwrap_or(10_000.0) as f32;
+        let global_rope_freq = cfg.rope_parameters.as_ref()
+            .and_then(|p| p.full_attention.as_ref())
+            .and_then(|p| p.rope_theta)
+            .unwrap_or(1_000_000.0) as f32;
+        let global_partial_rotary_factor = cfg.rope_parameters.as_ref()
+            .and_then(|p| p.full_attention.as_ref())
+            .and_then(|p| p.partial_rotary_factor)
+            .unwrap_or(1.0);
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(QDecoderLayer::new(
-                cfg, i,
-                rotary_emb_local.clone(),
-                rotary_emb_global.clone(),
-                loader, device,
-            )?);
-        }
+        // Pre-build shared RoPE embeddings (one per distinct config)
+        let sliding_head_dim = cfg.head_dim;
+        let global_head_dim = if cfg.global_head_dim > 0 { cfg.global_head_dim } else { cfg.head_dim };
+
+        let sliding_rope = Arc::new(RotaryEmbedding::new(sliding_head_dim, sliding_rope_freq, device)?);
+        let (global_rope_inner, global_rotary_dim) = RotaryEmbedding::new_partial(
+            global_head_dim, global_partial_rotary_factor, global_rope_freq, device,
+        )?;
+        let global_rope = Arc::new(global_rope_inner);
 
         let norm = QRmsNorm::new(
             loader.load("output_norm.weight", device)?,
@@ -472,13 +470,108 @@ impl QuantizedGemmaModel {
         )?;
 
         let lm_head = if cfg.tie_word_embeddings {
-            // Reuse the dequantized embedding as the output projection.
             QMatMul::Tensor(embed_tokens.clone())
         } else {
             QMatMul::from_qtensor(loader.load("output.weight", device)?)?
         };
 
         let ple = PleGlobal::new(cfg, loader, device)?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let prefix = format!("blk.{layer_idx}");
+            let is_sliding = cfg.is_sliding_layer(layer_idx);
+            let head_dim = cfg.head_dim_for_layer(layer_idx);
+            let n_kv_head = cfg.kv_heads_for_layer(layer_idx);
+            let n_head = cfg.num_attention_heads;
+            let q_dim = n_head * head_dim;
+
+            let attention_wq = QLinear::from_qtensor(loader.load(&format!("{prefix}.attn_q.weight"), device)?)?;
+            let attention_wk = QLinear::from_qtensor(loader.load(&format!("{prefix}.attn_k.weight"), device)?)?;
+            let attention_wv = QLinear::from_qtensor(loader.load(&format!("{prefix}.attn_v.weight"), device)?)?;
+            let attention_wo = QLinear::from_qtensor(loader.load(&format!("{prefix}.attn_output.weight"), device)?)?;
+
+            let attention_q_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.attn_q_norm.weight"), device)?,
+                cfg.rms_norm_eps, device,
+            )?;
+            let attention_k_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.attn_k_norm.weight"), device)?,
+                cfg.rms_norm_eps, device,
+            )?;
+
+            let attention_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.attn_norm.weight"), device)?,
+                cfg.rms_norm_eps, device,
+            )?;
+            let post_attention_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.post_attention_norm.weight"), device)?,
+                cfg.rms_norm_eps, device,
+            )?;
+            let ffn_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.ffn_norm.weight"), device)?,
+                cfg.rms_norm_eps, device,
+            )?;
+            let post_ffn_norm = QRmsNorm::new(
+                loader.load(&format!("{prefix}.post_ffw_norm.weight"), device)?,
+                cfg.rms_norm_eps, device,
+            )?;
+
+            let mlp = Mlp {
+                feed_forward_gate: QLinear::from_qtensor(loader.load(&format!("{prefix}.ffn_gate.weight"), device)?)?,
+                feed_forward_up: QLinear::from_qtensor(loader.load(&format!("{prefix}.ffn_up.weight"), device)?)?,
+                feed_forward_down: QLinear::from_qtensor(loader.load(&format!("{prefix}.ffn_down.weight"), device)?)?,
+            };
+
+            let sliding_window_size = if is_sliding { Some(cfg.sliding_window) } else { None };
+            let (rotary_embedding, rotary_dim) = if is_sliding {
+                (sliding_rope.clone(), sliding_head_dim)
+            } else {
+                (global_rope.clone(), global_rotary_dim)
+            };
+
+            // PLE components (optional)
+            let (ple_gate, ple_proj, ple_post_norm, layer_output_scale) = if cfg.hidden_size_per_layer_input > 0 {
+                let gate = QLinear::from_qtensor(loader.load(&format!("{prefix}.inp_gate.weight"), device)?)?;
+                let proj = QLinear::from_qtensor(loader.load(&format!("{prefix}.proj.weight"), device)?)?;
+                let post_norm = QRmsNorm::new(
+                    loader.load(&format!("{prefix}.post_norm.weight"), device)?,
+                    cfg.rms_norm_eps, device,
+                )?;
+                let scale = loader.load(&format!("{prefix}.layer_output_scale.weight"), device)?
+                    .dequantize(device)?;
+                (Some(gate), Some(proj), Some(post_norm), Some(scale))
+            } else {
+                (None, None, None, None)
+            };
+
+            layers.push(LayerWeights {
+                attention_wq,
+                attention_wk,
+                attention_wv,
+                attention_wo,
+                attention_q_norm,
+                attention_k_norm,
+                attention_norm,
+                post_attention_norm,
+                ffn_norm,
+                post_ffn_norm,
+                mlp,
+                n_head,
+                n_kv_head,
+                head_dim,
+                q_dim,
+                sliding_window_size,
+                rotary_embedding,
+                rotary_dim,
+                neg_inf: neg_inf.clone(),
+                kv_cache: None,
+                ple_gate,
+                ple_proj,
+                ple_post_norm,
+                layer_output_scale,
+            });
+        }
 
         Ok(Self {
             embed_tokens,
@@ -493,86 +586,79 @@ impl QuantizedGemmaModel {
     }
 
     pub fn forward(
-        &self,
+        &mut self,
         input_ids: &Tensor,
-        cache: &mut KvCache,
+        _cache: &mut KvCache,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let (_batch_size, seq_len) = input_ids.dims2()?;
+        let (b_sz, seq_len) = input_ids.dims2()?;
 
-        // Embedding lookup + scale
+        // Embedding lookup + scale (matches gemma3: tok_embeddings * sqrt(hidden_size))
         let embed = candle_nn::Embedding::new(self.embed_tokens.clone(), self.hidden_size);
-        let mut x = embed.forward(input_ids)?;
-        let scale = (self.hidden_size as f64).sqrt();
-        x = (x * scale)?;
+        let mut layer_in = embed.forward(input_ids)?;
+        layer_in = (layer_in * (self.hidden_size as f64).sqrt())?;
 
         // PLE global precomputation (E4B/E2B only)
         let per_layer_inputs = match &self.ple {
-            Some(ple) => Some(ple.precompute(input_ids, &x)?),
+            Some(ple) => Some(ple.precompute(input_ids, &layer_in)?),
             None => None,
         };
 
-        let (sliding_mask, global_mask) =
-            self.create_masks(seq_len, seqlen_offset, x.device())?;
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            let ple_input = per_layer_inputs.as_ref().map(|pli| {
-                pli.narrow(2, i, 1).unwrap().squeeze(2).unwrap() // [batch, seq, ple_dim]
-            });
-            let mask = if self.cfg.is_sliding_layer(i) {
-                sliding_mask.as_ref()
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Attention mask
+            let attention_mask = if seq_len == 1 {
+                None
             } else {
-                global_mask.as_ref()
+                Some(layer.mask(b_sz, seq_len, seqlen_offset, input_ids.device())?)
             };
-            x = layer.forward(&x, mask, cache.layer_mut(i), seqlen_offset, ple_input.as_ref())?;
+
+            // Attention block: norm → attn → post_norm → residual
+            let residual = &layer_in;
+            let x = layer.attention_norm.forward(&layer_in)?;
+            let x = layer.forward_attn(&x, attention_mask.as_ref(), seqlen_offset)?;
+            let x = layer.post_attention_norm.forward(&x)?;
+            let x = (x + residual)?;
+
+            // Feed-forward block: norm → mlp → post_norm → residual
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x)?;
+            let x = layer.post_ffn_norm.forward(&x)?;
+            let x = (x + residual)?;
+
+            // PLE sub-block (only for E4B/E2B)
+            let x = if let (Some(gate), Some(proj), Some(post_norm), Some(scale)) =
+                (&layer.ple_gate, &layer.ple_proj, &layer.ple_post_norm, &layer.layer_output_scale)
+            {
+                if let Some(ref pli) = per_layer_inputs {
+                    let ple_input = pli.narrow(2, layer_idx, 1)?.squeeze(2)?;
+                    let residual = &x;
+                    let gated = gate.forward(&x)?;
+                    let gated = candle_nn::Activation::GeluPytorchTanh.forward(&gated)?;
+                    let gated = (gated * ple_input)?;
+                    let projected = proj.forward(&gated)?;
+                    let normed = post_norm.forward(&projected)?;
+                    let x = (residual + normed)?;
+                    x.broadcast_mul(scale)?
+                } else {
+                    x
+                }
+            } else {
+                x
+            };
+
+            layer_in = x;
         }
 
-        // Take only the last token's hidden state for decoding
-        let x = x.narrow(1, seq_len - 1, 1)?;
+        // Final norm + output projection (take last token only)
+        let x = layer_in.i((.., seq_len - 1, ..))?;
         let x = self.norm.forward(&x)?;
         let logits = self.lm_head.forward(&x)?;
 
+        // Logit softcapping: tanh(logits / cap) * cap
         match self.final_logit_softcapping {
             Some(cap) => Ok(((logits / cap)?.tanh()? * cap)?),
             None => Ok(logits),
         }
-    }
-
-    fn create_masks(
-        &self,
-        seq_len: usize,
-        offset: usize,
-        device: &Device,
-    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        if seq_len == 1 {
-            return Ok((None, None));
-        }
-
-        // Standard causal mask
-        let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })
-            })
-            .collect();
-        let causal = Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)?;
-
-        // Sliding-window causal mask
-        let sw = self.cfg.sliding_window;
-        let sliding_mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..seq_len).map(move |j| {
-                    let pos_i = i + offset;
-                    let pos_j = j + offset;
-                    if j > i || (pos_i >= sw && pos_j < pos_i - sw + 1) {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.0
-                    }
-                })
-            })
-            .collect();
-        let sliding = Tensor::from_vec(sliding_mask, (1, 1, seq_len, seq_len), device)?;
-
-        Ok((Some(sliding), Some(causal)))
     }
 }

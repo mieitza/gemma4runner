@@ -68,7 +68,7 @@ enum ModelBackend {
 
 impl ModelBackend {
     fn forward(
-        &self,
+        &mut self,
         input_ids: &Tensor,
         cache: &mut KvCache,
         seqlen_offset: usize,
@@ -183,14 +183,14 @@ pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Re
 }
 
 fn engine_loop(
-    model: ModelBackend,
+    mut model: ModelBackend,
     tokenizer: GemmaTokenizer,
     config: Gemma4Config,
     device: Device,
     request_rx: mpsc::Receiver<InferenceRequest>,
 ) {
     while let Ok(request) = request_rx.recv() {
-        if let Err(e) = process_request(&model, &tokenizer, &config, &device, &request) {
+        if let Err(e) = process_request(&mut model, &tokenizer, &config, &device, &request) {
             let _ = request.response_tx.send(InferenceEvent::Error(e.to_string()));
         }
     }
@@ -198,7 +198,7 @@ fn engine_loop(
 }
 
 fn process_request(
-    model: &ModelBackend,
+    model: &mut ModelBackend,
     tokenizer: &GemmaTokenizer,
     config: &Gemma4Config,
     device: &Device,
