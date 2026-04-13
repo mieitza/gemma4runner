@@ -223,6 +223,29 @@ GGUF quantized formats (Q4_K_M, Q8_0, Q5_K_M, etc.) work on both CPU and CUDA. T
 | Slow first token (prefill) | Expected for large context; subsequent tokens are fast |
 | `Invalid matmul arguments` shape errors | Ensure you are using a GGUF file converted for Gemma 4 (not Gemma 3) |
 
+## Docker
+
+### CUDA (DGX / GPU servers)
+
+```bash
+docker build -t gemma4runner:cuda .
+
+# Run with GPU access — mount your GGUF model
+docker run --gpus all -p 8080:8080 \
+  -v /path/to/model.gguf:/model \
+  gemma4runner:cuda
+```
+
+### CPU only
+
+```bash
+docker build -f Dockerfile.cpu -t gemma4runner:cpu .
+
+docker run -p 8080:8080 \
+  -v /path/to/model.gguf:/model \
+  gemma4runner:cpu
+```
+
 ## License
 
 MIT
