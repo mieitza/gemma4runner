@@ -23,10 +23,22 @@ use crate::kv_cache::KvCache;
 pub trait TensorLoader {
     fn load(&self, name: &str, device: &Device) -> Result<QTensor>;
 
+    /// Dequantize a tensor and ensure the result lives on `device`.
+    ///
+    /// `QTensor::dequantize` internally calls `.to_device(device)`, but we add
+    /// an explicit `.to_device()` as a defensive measure for GPU backends
+    /// (CUDA, Metal) where a mismatch between QTensor storage location and
+    /// the target device would cause silent errors or panics.
     fn load_dequantized(&self, name: &str, device: &Device) -> Result<Tensor> {
-        self.load(name, device)?
-            .dequantize(device)
-            .map_err(Into::into)
+        let tensor = self.load(name, device)?
+            .dequantize(device)?;
+        // Defensive: ensure the result is on the target device even if
+        // dequantize returned a CPU tensor (e.g. for non-quantized dtypes).
+        if tensor.device().location() != device.location() {
+            tensor.to_device(device).map_err(Into::into)
+        } else {
+            Ok(tensor)
+        }
     }
 }
 
@@ -42,6 +54,12 @@ struct QRmsNorm {
 impl QRmsNorm {
     fn new(qtensor: QTensor, eps: f64, device: &Device) -> Result<Self> {
         let weight = qtensor.dequantize(device)?;
+        // Defensive: ensure the norm weight lives on the target device.
+        let weight = if weight.device().location() != device.location() {
+            weight.to_device(device)?
+        } else {
+            weight
+        };
         Ok(Self { weight, eps: eps as f32 })
     }
 
@@ -92,6 +110,12 @@ impl PleGlobal {
 
         let token_embd = loader.load("per_layer_token_embd.weight", device)?
             .dequantize(device)?;
+        // Defensive: ensure PLE embedding is on the target device.
+        let token_embd = if token_embd.device().location() != device.location() {
+            token_embd.to_device(device)?
+        } else {
+            token_embd
+        };
         let model_proj = QLinear::from_qtensor(loader.load("per_layer_model_proj.weight", device)?)?;
         let proj_norm = QRmsNorm::new(
             loader.load("per_layer_proj_norm.weight", device)?,
@@ -263,7 +287,13 @@ struct LayerWeights {
 
     neg_inf: Tensor,
 
-    // RMS norm epsilon (for V norm which has no learned weight)
+    // Pre-computed epsilon tensor on the target device (avoids CPU↔GPU transfers
+    // when computing V-norm during attention).
+    rms_norm_eps_tensor: Tensor,
+
+    // RMS norm epsilon scalar value (retained for debugging; the pre-computed
+    // tensor rms_norm_eps_tensor is used in forward_attn).
+    #[allow(dead_code)]
     rms_norm_eps: f32,
 
     // Whether this layer computes its own KV (false for shared KV layers)
@@ -277,6 +307,9 @@ struct LayerWeights {
     ple_proj: Option<QLinear>,
     ple_post_norm: Option<QRmsNorm>,
     layer_output_scale: Option<Tensor>,
+
+    // The device this layer's tensors live on (CPU, Metal, or CUDA).
+    device: Device,
 }
 
 impl LayerWeights {
@@ -364,11 +397,15 @@ impl LayerWeights {
 
             // V norm — RMS norm without learned weight (with_scale=False in HuggingFace,
             // raw ggml_rms_norm in llama.cpp). Normalizes each value head vector.
+            //
+            // The epsilon addition uses a pre-computed tensor on the target device
+            // (self.rms_norm_eps_tensor) to avoid creating CPU scalars that could
+            // trigger cross-device errors on CUDA/Metal.
             let v = {
                 let v_f32 = v.to_dtype(DType::F32)?;
                 let sq = v_f32.sqr()?;
                 let mean_sq = (sq.sum_keepdim(D::Minus1)? / self.head_dim as f64)?;
-                let rms = (mean_sq + self.rms_norm_eps as f64)?.sqrt()?;
+                let rms = mean_sq.broadcast_add(&self.rms_norm_eps_tensor)?.sqrt()?;
                 v_f32.broadcast_div(&rms)?.to_dtype(v.dtype())?
             };
 
@@ -474,6 +511,8 @@ pub struct QuantizedGemmaModel {
     /// Number of layers from the start that have their own KV.
     /// Layers >= this index reuse KV from a reference layer.
     n_layer_kv_from_start: usize,
+    /// The device all tensors live on (CPU, Metal, or CUDA).
+    device: Device,
 }
 
 impl QuantizedGemmaModel {
@@ -484,8 +523,17 @@ impl QuantizedGemmaModel {
         device: &Device,
     ) -> Result<Self> {
         let embed_tokens = loader.load_dequantized("token_embd.weight", device)?;
+        tracing::debug!(
+            "embed_tokens device: {:?}, dtype: {:?}",
+            embed_tokens.device(),
+            embed_tokens.dtype()
+        );
 
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
+        // Pre-compute the RMS norm epsilon as a tensor on the target device.
+        // This avoids creating CPU scalars during V-norm computation in
+        // forward_attn, which would cause cross-device errors on CUDA/Metal.
+        let rms_norm_eps_tensor = Tensor::new(cfg.rms_norm_eps as f32, device)?;
 
         // Build per-layer RoPE embeddings (different head_dim and freq per layer type)
         // Sliding layers: full rotation, local freq base
@@ -593,6 +641,12 @@ impl QuantizedGemmaModel {
                 )?;
                 let scale = loader.load(&format!("{prefix}.layer_output_scale.weight"), device)?
                     .dequantize(device)?;
+                // Defensive: ensure the scale tensor is on the target device.
+                let scale = if scale.device().location() != device.location() {
+                    scale.to_device(device)?
+                } else {
+                    scale
+                };
                 (Some(gate), Some(proj), Some(post_norm), Some(scale))
             } else {
                 (None, None, None, None)
@@ -618,6 +672,7 @@ impl QuantizedGemmaModel {
                 rotary_embedding,
                 rotary_dim,
                 neg_inf: neg_inf.clone(),
+                rms_norm_eps_tensor: rms_norm_eps_tensor.clone(),
                 rms_norm_eps: cfg.rms_norm_eps as f32,
                 has_kv: layer_idx < n_layer_kv_from_start,
                 kv_cache: None,
@@ -625,6 +680,7 @@ impl QuantizedGemmaModel {
                 ple_proj,
                 ple_post_norm,
                 layer_output_scale,
+                device: device.clone(),
             });
         }
 
@@ -638,6 +694,7 @@ impl QuantizedGemmaModel {
             cfg: cfg.clone(),
             ple,
             n_layer_kv_from_start,
+            device: device.clone(),
         })
     }
 
@@ -649,25 +706,33 @@ impl QuantizedGemmaModel {
     ) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids.dims2()?;
 
+        // Ensure input_ids are on the model's device (defensive for GPU backends).
+        let input_ids = if input_ids.device().location() != self.device.location() {
+            std::borrow::Cow::Owned(input_ids.to_device(&self.device)?)
+        } else {
+            std::borrow::Cow::Borrowed(input_ids)
+        };
+
         // Embedding lookup + scale (matches gemma3: tok_embeddings * sqrt(hidden_size))
         let embed = candle_nn::Embedding::new(self.embed_tokens.clone(), self.hidden_size);
-        let mut layer_in = embed.forward(input_ids)?;
+        let mut layer_in = embed.forward(&input_ids)?;
         layer_in = (layer_in * (self.hidden_size as f64).sqrt())?;
 
         // PLE global precomputation (E4B/E2B only)
         let per_layer_inputs = match &self.ple {
-            Some(ple) => Some(ple.precompute(input_ids, &layer_in)?),
+            Some(ple) => Some(ple.precompute(&input_ids, &layer_in)?),
             None => None,
         };
 
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
 
-            // Attention mask
+            // Attention mask — always created on the layer's device to avoid
+            // cross-device errors on CUDA/Metal.
             let attention_mask = if seq_len == 1 {
                 None
             } else {
-                Some(layer.mask(b_sz, seq_len, seqlen_offset, input_ids.device())?)
+                Some(layer.mask(b_sz, seq_len, seqlen_offset, &layer.device)?)
             };
 
             // For shared KV layers, clone KV cache from the reference layer

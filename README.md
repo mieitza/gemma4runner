@@ -169,9 +169,59 @@ cargo build --release
 # With Metal GPU support (macOS)
 cargo build --release --features metal
 
-# With CUDA GPU support
+# With CUDA GPU support (requires CUDA toolkit)
 cargo build --release --features cuda
 ```
+
+## NVIDIA GPU / DGX Deployment
+
+gemma4runner supports NVIDIA CUDA GPUs (A100, H100, etc.) for accelerated GGUF inference. All quantized tensor operations (QMatMul) run natively on GPU via candle's CUDA kernels, and all intermediate tensors (embeddings, norms, RoPE, attention masks) are kept on-device to avoid CPU-GPU transfers.
+
+### Prerequisites
+
+- **CUDA Toolkit** 11.8+ (12.x recommended). Install from [NVIDIA](https://developer.nvidia.com/cuda-downloads) or via your package manager.
+- **cuDNN** (optional, not required for candle's quantized path).
+- The `nvcc` compiler must be on `$PATH` so candle can build its CUDA kernels at compile time.
+- Rust 1.82+ (edition 2024).
+
+### Building on DGX / Linux with CUDA
+
+```bash
+# Verify CUDA is visible
+nvcc --version
+nvidia-smi
+
+# Build with CUDA support
+cargo build --release --features cuda
+
+# Run with GPU acceleration (uses GPU 0 by default)
+./target/release/gemma4runner serve \
+  --model /path/to/gemma-4-E4B-it-Q4_K_M.gguf \
+  --device cuda
+
+# Use a specific GPU (e.g., GPU 2 on a multi-GPU DGX)
+./target/release/gemma4runner serve \
+  --model /path/to/gemma-4-E4B-it-Q4_K_M.gguf \
+  --device cuda:2
+```
+
+### Multi-GPU Notes
+
+- Each `gemma4runner` process uses a single GPU. For multi-GPU setups, run separate instances on different ports with `--device cuda:0`, `--device cuda:1`, etc., and load-balance across them.
+- The `--device auto` flag selects CUDA automatically when the `cuda` feature is compiled in.
+
+### Supported Quantizations
+
+GGUF quantized formats (Q4_K_M, Q8_0, Q5_K_M, etc.) work on both CPU and CUDA. The quantized matmul kernels run directly on GPU without dequantizing full weight matrices to memory, keeping VRAM usage efficient.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `nvcc` not found at build time | Add CUDA toolkit `bin/` to `$PATH` |
+| CUDA out of memory | Use a smaller quantization (Q4_K_M) or a smaller model variant |
+| Slow first token (prefill) | Expected for large context; subsequent tokens are fast |
+| `Invalid matmul arguments` shape errors | Ensure you are using a GGUF file converted for Gemma 4 (not Gemma 3) |
 
 ## License
 
