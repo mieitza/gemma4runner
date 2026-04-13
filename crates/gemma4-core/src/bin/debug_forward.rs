@@ -93,15 +93,15 @@ fn main() -> Result<()> {
     let gate_out = gate_matmul.forward(&normed)?;
     print_stats("After FFN gate (blk.0)", &gate_out);
 
-    // Now run the full model
-    println!("\n=== Full model forward pass ===");
+    // Run with just BOS token [2] for comparison with llama.cpp
+    println!("\n=== Single BOS token forward pass ===");
+    let bos_ids = Tensor::new(&[2u32], &device)?.unsqueeze(0)?;
     let mut q_model = gemma4_core::quantized_model::QuantizedGemmaModel::new(cfg, &gguf, &device)?;
     let mut cache = gemma4_core::kv_cache::KvCache::new(&cfg.layer_types, cfg.sliding_window);
-    let logits = q_model.forward(&input_ids, &mut cache, 0)?;
-    print_stats("Final logits", &logits);
+    let logits_bos = q_model.forward(&bos_ids, &mut cache, 0)?;
+    print_stats("BOS logits", &logits_bos);
 
-    // Get top-5 tokens
-    let logits_flat = logits.squeeze(0)?.squeeze(0)?;
+    let logits_flat = logits_bos.squeeze(0)?;
     let logits_vec: Vec<f32> = logits_flat.to_vec1()?;
     let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());

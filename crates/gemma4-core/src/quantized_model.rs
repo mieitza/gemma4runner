@@ -265,6 +265,9 @@ struct LayerWeights {
     // RMS norm epsilon (for V norm which has no learned weight)
     rms_norm_eps: f32,
 
+    // Whether this layer computes its own KV (false for shared KV layers)
+    has_kv: bool,
+
     // KV cache
     kv_cache: Option<(Tensor, Tensor)>,
 
@@ -319,72 +322,98 @@ impl LayerWeights {
         x: &Tensor,
         mask: Option<&Tensor>,
         index_pos: usize,
+        shared_kv: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
         let q = self.attention_wq.forward(x)?;
-        let k = self.attention_wk.forward(x)?;
-        let v = self.attention_wv.forward(x)?;
-
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
             .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
 
-        // Per-head Q/K norms — .contiguous() before norm (critical, line 203-204 in gemma3)
+        // Per-head Q norm
         let q = self.attention_q_norm.forward(&q.contiguous()?)?;
-        let k = self.attention_k_norm.forward(&k.contiguous()?)?;
 
-        // V normalization — RMSNorm without learned weight (Gemma4-specific)
-        // Formula: v / sqrt(mean(v^2) + eps)
-        // RoPE — handle partial rotation for global layers
-        let (q, k) = if self.rotary_dim < self.head_dim {
+        // RoPE on Q only (K gets RoPE only if this layer computes its own K)
+        let q = if self.rotary_dim < self.head_dim {
             let q_rot = q.narrow(D::Minus1, 0, self.rotary_dim)?;
             let q_pass = q.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?;
-            let k_rot = k.narrow(D::Minus1, 0, self.rotary_dim)?;
-            let k_pass = k.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?;
-            let (q_rot, k_rot) = self.rotary_embedding.apply_rotary_emb_qkv(&q_rot, &k_rot, index_pos)?;
-            (
-                Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?,
-                Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?,
-            )
+            let cos = self.rotary_embedding.cos.narrow(0, index_pos, seq_len)?;
+            let sin = self.rotary_embedding.sin.narrow(0, index_pos, seq_len)?;
+            let q_rot = candle_nn::rotary_emb::rope(&q_rot.contiguous()?, &cos, &sin)?;
+            Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?
         } else {
-            self.rotary_embedding.apply_rotary_emb_qkv(&q, &k, index_pos)?
+            let cos = self.rotary_embedding.cos.narrow(0, index_pos, seq_len)?;
+            let sin = self.rotary_embedding.sin.narrow(0, index_pos, seq_len)?;
+            candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?
         };
 
-        // KV cache
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                if index_pos == 0 {
-                    (k, v)
+        // K/V: either compute from this layer's weights, or reuse from shared layer
+        let (k, v) = if self.has_kv {
+            // This layer computes its own K/V
+            let k = self.attention_wk.forward(x)?;
+            let v = self.attention_wv.forward(x)?;
+
+            let k = k
+                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+
+            // K norm
+            let k = self.attention_k_norm.forward(&k.contiguous()?)?;
+
+            // RoPE on K
+            let k = if self.rotary_dim < self.head_dim {
+                let k_rot = k.narrow(D::Minus1, 0, self.rotary_dim)?;
+                let k_pass = k.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?;
+                let cos = self.rotary_embedding.cos.narrow(0, index_pos, seq_len)?;
+                let sin = self.rotary_embedding.sin.narrow(0, index_pos, seq_len)?;
+                let k_rot = candle_nn::rotary_emb::rope(&k_rot.contiguous()?, &cos, &sin)?;
+                Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?
+            } else {
+                let cos = self.rotary_embedding.cos.narrow(0, index_pos, seq_len)?;
+                let sin = self.rotary_embedding.sin.narrow(0, index_pos, seq_len)?;
+                candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?
+            };
+
+            // KV cache update
+            let (k, v) = match &self.kv_cache {
+                None => (k, v),
+                Some((k_cache, v_cache)) => {
+                    if index_pos == 0 {
+                        (k, v)
+                    } else {
+                        let k = Tensor::cat(&[k_cache, &k], 2)?;
+                        let v = Tensor::cat(&[v_cache, &v], 2)?;
+                        (k, v)
+                    }
+                }
+            };
+
+            // Sliding window eviction
+            let (k, v) = if let Some(window) = self.sliding_window_size {
+                let kv_seq_len = k.dim(2)?;
+                if kv_seq_len > window {
+                    let start = kv_seq_len - window;
+                    (k.narrow(2, start, window)?, v.narrow(2, start, window)?)
                 } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?;
                     (k, v)
                 }
-            }
-        };
-
-        // Sliding window eviction
-        let (k, v) = if let Some(window) = self.sliding_window_size {
-            let kv_seq_len = k.dim(2)?;
-            if kv_seq_len > window {
-                let start = kv_seq_len - window;
-                (k.narrow(2, start, window)?, v.narrow(2, start, window)?)
             } else {
                 (k, v)
-            }
-        } else {
-            (k, v)
-        };
+            };
 
-        self.kv_cache = Some((k.clone(), v.clone()));
+            self.kv_cache = Some((k.clone(), v.clone()));
+            (k, v)
+        } else {
+            // Shared KV layer — reuse from the reference layer's cache
+            match shared_kv {
+                Some((k, v)) => (k.clone(), v.clone()),
+                None => anyhow::bail!("Shared KV layer {} has no reference KV cache", 0),
+            }
+        };
 
         // Repeat KV for GQA
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
@@ -431,6 +460,9 @@ pub struct QuantizedGemmaModel {
     #[allow(dead_code)]
     cfg: Gemma4TextConfig,
     ple: Option<PleGlobal>,
+    /// Number of layers from the start that have their own KV.
+    /// Layers >= this index reuse KV from a reference layer.
+    n_layer_kv_from_start: usize,
 }
 
 impl QuantizedGemmaModel {
@@ -483,6 +515,9 @@ impl QuantizedGemmaModel {
         };
 
         let ple = PleGlobal::new(cfg, loader, device)?;
+
+        // KV sharing: last N layers reuse KV from earlier layers
+        let n_layer_kv_from_start = cfg.num_hidden_layers - cfg.num_kv_shared_layers;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
@@ -573,6 +608,7 @@ impl QuantizedGemmaModel {
                 rotary_dim,
                 neg_inf: neg_inf.clone(),
                 rms_norm_eps: cfg.rms_norm_eps as f32,
+                has_kv: layer_idx < n_layer_kv_from_start,
                 kv_cache: None,
                 ple_gate,
                 ple_proj,
@@ -590,6 +626,7 @@ impl QuantizedGemmaModel {
             hidden_size: cfg.hidden_size,
             cfg: cfg.clone(),
             ple,
+            n_layer_kv_from_start,
         })
     }
 
@@ -612,7 +649,8 @@ impl QuantizedGemmaModel {
             None => None,
         };
 
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
 
             // Attention mask
             let attention_mask = if seq_len == 1 {
@@ -621,10 +659,25 @@ impl QuantizedGemmaModel {
                 Some(layer.mask(b_sz, seq_len, seqlen_offset, input_ids.device())?)
             };
 
+            // For shared KV layers, clone KV cache from the reference layer
+            let shared_kv = if !self.layers[layer_idx].has_kv {
+                let is_sliding = self.layers[layer_idx].sliding_window_size.is_some();
+                let ref_layer = if is_sliding {
+                    self.n_layer_kv_from_start.saturating_sub(2)
+                } else {
+                    self.n_layer_kv_from_start.saturating_sub(1)
+                };
+                self.layers[ref_layer].kv_cache.clone()
+            } else {
+                None
+            };
+
+            let layer = &mut self.layers[layer_idx];
+
             // Attention block: norm → attn → post_norm → residual
             let residual = &layer_in;
             let x = layer.attention_norm.forward(&layer_in)?;
-            let x = layer.forward_attn(&x, attention_mask.as_ref(), seqlen_offset)?;
+            let x = layer.forward_attn(&x, attention_mask.as_ref(), seqlen_offset, shared_kv.as_ref())?;
             let x = layer.post_attention_norm.forward(&x)?;
             let x = (x + residual)?;
 

@@ -168,6 +168,7 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         tie_word_embeddings: true,
         layer_types,
         rope_parameters,
+        num_kv_shared_layers: get_u32(&["gemma4.attention.shared_kv_layers"]).unwrap_or(0),
         enable_moe_block: get_u32(&["gemma4.expert_count"]).map(|n| n > 0).unwrap_or(false),
         num_experts: get_u32(&["gemma4.expert_count"]),
         top_k_experts: get_u32(&["gemma4.expert_used_count"]),

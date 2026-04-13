@@ -39,6 +39,8 @@ pub struct Gemma4TextConfig {
     #[serde(default)]
     pub rope_parameters: Option<RopeParameters>,
     #[serde(default)]
+    pub num_kv_shared_layers: usize,
+    #[serde(default)]
     pub enable_moe_block: bool,
     #[serde(default)]
     pub num_experts: Option<usize>,
