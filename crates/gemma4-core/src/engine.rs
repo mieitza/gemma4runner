@@ -60,10 +60,36 @@ impl std::fmt::Display for FinishReason {
     }
 }
 
-/// Dispatch enum over the two model backends (safetensors and quantized GGUF).
+/// Which backend implementation to request when starting the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendChoice {
+    /// Automatically pick the best available backend.
+    Auto,
+    /// Force the candle-based backend (safetensors or our GGUF decoder).
+    Candle,
+    /// Force the llama.cpp backend (requires the `llama-cpp` feature).
+    LlamaCpp,
+}
+
+impl std::str::FromStr for BackendChoice {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "candle" => Ok(Self::Candle),
+            "llama-cpp" | "llama_cpp" | "llamacpp" => Ok(Self::LlamaCpp),
+            other => Err(anyhow::anyhow!("Unknown backend '{}'. Use: auto, candle, llama-cpp", other)),
+        }
+    }
+}
+
+/// Dispatch enum over the model backends.
+#[allow(dead_code)]
 enum ModelBackend {
     Safetensors(crate::model::GemmaTextModel),
     Quantized(crate::quantized_model::QuantizedGemmaModel),
+    #[cfg(feature = "llama-cpp")]
+    LlamaCpp(crate::llama_cpp_backend::backend::LlamaCppBackend),
 }
 
 impl ModelBackend {
@@ -76,7 +102,21 @@ impl ModelBackend {
         match self {
             Self::Safetensors(m) => m.forward(input_ids, cache, seqlen_offset),
             Self::Quantized(m) => m.forward(input_ids, cache, seqlen_offset),
+            #[cfg(feature = "llama-cpp")]
+            Self::LlamaCpp(_) => {
+                unreachable!("LlamaCpp backend does not use the candle forward path")
+            }
         }
+    }
+
+    /// Returns `true` when this is the llama.cpp backend.
+    #[allow(dead_code)]
+    fn is_llama_cpp(&self) -> bool {
+        #[cfg(feature = "llama-cpp")]
+        if matches!(self, Self::LlamaCpp(_)) {
+            return true;
+        }
+        false
     }
 }
 
@@ -120,9 +160,61 @@ pub fn device_from_string(s: &str) -> Result<Device> {
 }
 
 pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Result<EngineHandle> {
+    start_engine_with_backend(model_path, device, queue_depth, BackendChoice::Auto)
+}
+
+pub fn start_engine_with_backend(
+    model_path: &Path,
+    device: Device,
+    queue_depth: usize,
+    backend_choice: BackendChoice,
+) -> Result<EngineHandle> {
+    // --- Decide whether to use the llama.cpp backend ---
+    #[cfg(feature = "llama-cpp")]
+    let use_llama_cpp = match backend_choice {
+        BackendChoice::LlamaCpp => {
+            if !loader::is_gguf_file(model_path) {
+                anyhow::bail!("--backend llama-cpp requires a .gguf model file");
+            }
+            true
+        }
+        BackendChoice::Auto => loader::is_gguf_file(model_path),
+        BackendChoice::Candle => false,
+    };
+
+    #[cfg(not(feature = "llama-cpp"))]
+    {
+        if backend_choice == BackendChoice::LlamaCpp {
+            anyhow::bail!(
+                "--backend llama-cpp requested but the binary was not compiled with the \
+                 `llama-cpp` feature. Rebuild with: cargo build --features llama-cpp-metal"
+            );
+        }
+    }
+
+    // --- llama.cpp fast path ---
+    #[cfg(feature = "llama-cpp")]
+    if use_llama_cpp {
+        tracing::info!("Using llama.cpp backend for GGUF model");
+        let llama = crate::llama_cpp_backend::backend::LlamaCppBackend::new(
+            model_path,
+            999, // offload all layers to GPU
+            0,   // 0 = use model's training context length
+        )?;
+
+        let (request_tx, request_rx) = mpsc::sync_channel::<InferenceRequest>(queue_depth);
+        thread::Builder::new()
+            .name("inference-engine-llamacpp".to_string())
+            .spawn(move || {
+                engine_loop_llama_cpp(llama, request_rx);
+            })?;
+        return Ok(EngineHandle { request_tx });
+    }
+
+    // --- Candle path (safetensors or our GGUF decoder) ---
     let (backend, tokenizer, config) = if loader::is_gguf_file(model_path) {
-        // --- GGUF path ---
-        tracing::info!("Detected GGUF file: {}", model_path.display());
+        // --- GGUF path via candle ---
+        tracing::info!("Detected GGUF file: {} (using candle backend)", model_path.display());
 
         let gguf = crate::gguf_loader::GgufModel::load(model_path, &device)?;
         let text_config = gguf.config.clone();
@@ -292,5 +384,106 @@ fn process_request(
 
     let _ = request.response_tx.send(InferenceEvent::Usage(UsageStats { prompt_tokens: prompt_len, completion_tokens: generated_tokens.len() }));
     let _ = request.response_tx.send(InferenceEvent::Done(finish_reason));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// llama.cpp engine loop
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "llama-cpp")]
+fn engine_loop_llama_cpp(
+    llama: crate::llama_cpp_backend::backend::LlamaCppBackend,
+    request_rx: mpsc::Receiver<InferenceRequest>,
+) {
+    while let Ok(request) = request_rx.recv() {
+        if let Err(e) = process_request_llama_cpp(&llama, &request) {
+            let _ = request.response_tx.send(InferenceEvent::Error(e.to_string()));
+        }
+    }
+    tracing::info!("llama.cpp inference engine shutting down");
+}
+
+#[cfg(feature = "llama-cpp")]
+fn process_request_llama_cpp(
+    llama: &crate::llama_cpp_backend::backend::LlamaCppBackend,
+    request: &InferenceRequest,
+) -> Result<()> {
+    // Format the prompt using our chat template
+    let prompt = match &request.input {
+        InferenceInput::Chat(messages) => {
+            llama.format_prompt(messages, &request.tools, request.include_thinking)
+        }
+        InferenceInput::Raw(text) => text.clone(),
+    };
+
+    let mut think_parser = crate::think_parser::ThinkParser::new(request.include_thinking);
+    let mut all_text = String::new();
+    let mut completion_tokens = 0usize;
+
+    // Estimate prompt length from the tokenizer for usage stats
+    let prompt_tokens = llama.tokenize(&prompt, false)
+        .map(|t| t.len())
+        .unwrap_or(0);
+
+    let tx = &request.response_tx;
+
+    let _generated = llama.generate_streaming(
+        &prompt,
+        &request.sampling,
+        |_token, text| {
+            completion_tokens += 1;
+            all_text.push_str(text);
+
+            // Feed through the think parser for streaming
+            for event in think_parser.feed(text) {
+                match event {
+                    crate::think_parser::ThinkEvent::Content(s) => {
+                        let _ = tx.send(InferenceEvent::Token(s));
+                    }
+                    crate::think_parser::ThinkEvent::Thinking(s) => {
+                        let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                    }
+                }
+            }
+            true // continue generating
+        },
+    )?;
+
+    // Flush remaining think-parser buffer
+    for event in think_parser.flush() {
+        match event {
+            crate::think_parser::ThinkEvent::Content(s) => {
+                let _ = tx.send(InferenceEvent::Token(s));
+            }
+            crate::think_parser::ThinkEvent::Thinking(s) => {
+                let _ = tx.send(InferenceEvent::ThinkingToken(s));
+            }
+        }
+    }
+
+    // Determine finish reason
+    // If generate_streaming returned because is_eog was true, the loop
+    // exited naturally.  We infer Stop if completion_tokens < max_tokens.
+    let mut finish_reason = if completion_tokens < request.sampling.max_tokens {
+        FinishReason::Stop
+    } else {
+        FinishReason::Length
+    };
+
+    // Check for tool calls in the full output
+    if crate::tool_parser::has_tool_calls(&all_text) {
+        let parsed = crate::tool_parser::parse_tool_calls(&all_text);
+        if !parsed.is_empty() {
+            let _ = tx.send(InferenceEvent::ToolCalls(parsed));
+            finish_reason = FinishReason::ToolCalls;
+        }
+    }
+
+    let _ = tx.send(InferenceEvent::Usage(UsageStats {
+        prompt_tokens,
+        completion_tokens,
+    }));
+    let _ = tx.send(InferenceEvent::Done(finish_reason));
     Ok(())
 }

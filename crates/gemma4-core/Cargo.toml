@@ -15,8 +15,12 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 hf-hub = "0.5"
+llama-cpp-2 = { workspace = true, optional = true }
 
 [features]
 default = []
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+llama-cpp = ["llama-cpp-2"]
+llama-cpp-metal = ["llama-cpp", "llama-cpp-2/metal"]
+llama-cpp-cuda = ["llama-cpp", "llama-cpp-2/cuda"]

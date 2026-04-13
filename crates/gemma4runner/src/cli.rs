@@ -20,6 +20,8 @@ pub enum Commands {
         #[arg(long, env = "GEMMA4_AUTH_API_KEY")] api_key: Option<String>,
         #[arg(long)] log_level: Option<String>,
         #[arg(long)] queue_depth: Option<usize>,
+        /// Inference backend: auto (default), candle, llama-cpp
+        #[arg(long, default_value = "auto")] backend: String,
     },
     /// Print model details without loading weights
     Info {

@@ -24,3 +24,6 @@ serde_json = { workspace = true }
 default = []
 metal = ["gemma4-core/metal"]
 cuda = ["gemma4-core/cuda"]
+llama-cpp = ["gemma4-core/llama-cpp"]
+llama-cpp-metal = ["gemma4-core/llama-cpp-metal"]
+llama-cpp-cuda = ["gemma4-core/llama-cpp-cuda"]

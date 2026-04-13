@@ -12,7 +12,7 @@ use std::fs;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve { model, config, host, port, device, hf_token, api_key, log_level, queue_depth } => {
+        Commands::Serve { model, config, host, port, device, hf_token, api_key, log_level, queue_depth, backend } => {
             let file_config = match &config {
                 Some(path) => AppConfig::load(&PathBuf::from(path))?,
                 None => AppConfig::default(),
@@ -32,12 +32,16 @@ async fn main() -> Result<()> {
             let queue_depth = queue_depth.or(file_config.server.queue_depth).unwrap_or(64);
             let api_key = api_key.or(file_config.auth.api_key);
 
+            let backend_choice: gemma4_core::engine::BackendChoice = backend.parse()?;
+
             let model_path = gemma4_core::loader::resolve_model_source(&model_source, hf_token.as_deref())?;
             let dev = gemma4_core::engine::device_from_string(&device_str)?;
-            tracing::info!("Using device: {}", device_str);
+            tracing::info!("Using device: {}, backend: {:?}", device_str, backend_choice);
 
             tracing::info!("Loading model from {}", model_path.display());
-            let engine = gemma4_core::engine::start_engine(&model_path, dev, queue_depth)?;
+            let engine = gemma4_core::engine::start_engine_with_backend(
+                &model_path, dev, queue_depth, backend_choice,
+            )?;
 
             tracing::info!("Starting server on {}:{}", host, port);
             gemma4_api::server::start_server(engine, &host, port, api_key).await?;
