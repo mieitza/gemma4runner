@@ -88,26 +88,67 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         .unwrap_or(hidden_size * 4);
     let vocab_size = get_u32(&["gemma4.vocab_size", "tokenizer.ggml.tokens"])
         .unwrap_or(262144);
-    // GGUF key_length is the GLOBAL head dim (512 for E4B).
-    // The sliding head_dim is typically 256 for all Gemma 4 models.
-    // We derive it: if key_length > 256, the global_head_dim = key_length, head_dim = 256.
-    let key_length = get_u32(&["gemma4.attention.key_length"]).unwrap_or(256);
-    let head_dim = if key_length > 256 { 256 } else { key_length };
-    let global_head_dim = if key_length > 256 { key_length } else { 512 };
+    // Head dims: GGUF has separate key lengths for sliding (SWA) and full attention
+    let global_head_dim = get_u32(&["gemma4.attention.key_length"]).unwrap_or(512);
+    let head_dim = get_u32(&["gemma4.attention.key_length_swa"]).unwrap_or(256);
     let rms_norm_eps = get_f64(&["gemma4.attention.layer_norm_rms_epsilon"]).unwrap_or(1e-6);
     let sliding_window = get_u32(&["gemma4.attention.sliding_window"]).unwrap_or(512);
     let max_position_embeddings = get_u32(&["gemma4.context_length"]).unwrap_or(131072);
 
-    // Build layer_types from num_hidden_layers (default 5:1 pattern)
-    let layer_types: Vec<String> = (0..num_hidden_layers)
-        .map(|i| {
-            if (i + 1) % 6 == 0 {
-                "full_attention".to_string()
-            } else {
-                "sliding_attention".to_string()
-            }
-        })
-        .collect();
+    // RoPE parameters from GGUF metadata
+    let rope_theta_full = get_f64(&["gemma4.rope.freq_base"]).unwrap_or(1000000.0);
+    let rope_theta_swa = get_f64(&["gemma4.rope.freq_base_swa"]).unwrap_or(10000.0);
+    let rope_dim_full = get_u32(&["gemma4.rope.dimension_count"]).unwrap_or(global_head_dim);
+    let rope_dim_swa = get_u32(&["gemma4.rope.dimension_count_swa"]).unwrap_or(head_dim);
+
+    // Compute partial_rotary_factor for full attention (if RoPE dim < head_dim)
+    let partial_rotary_factor = if rope_dim_full < global_head_dim {
+        rope_dim_full as f64 / global_head_dim as f64
+    } else {
+        1.0
+    };
+
+    let rope_parameters = Some(crate::config::RopeParameters {
+        full_attention: Some(crate::config::RopeLayerParams {
+            rope_theta: Some(rope_theta_full),
+            rope_type: Some("proportional".to_string()),
+            partial_rotary_factor: Some(partial_rotary_factor),
+        }),
+        sliding_attention: Some(crate::config::RopeLayerParams {
+            rope_theta: Some(rope_theta_swa),
+            rope_type: Some("default".to_string()),
+            partial_rotary_factor: None,
+        }),
+    });
+
+    // Build layer_types from the sliding_window_pattern metadata if available
+    // The pattern is stored as an array of booleans: true = sliding, false = full
+    let layer_types: Vec<String> = if let Some(val) = metadata.get("gemma4.attention.sliding_window_pattern") {
+        // Try to parse as boolean array
+        if let Ok(arr_str) = val.to_string() {
+            // Fallback: generate from num_hidden_layers with default pattern
+            (0..num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % 6 == 0 { "full_attention".to_string() }
+                    else { "sliding_attention".to_string() }
+                })
+                .collect()
+        } else {
+            (0..num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % 6 == 0 { "full_attention".to_string() }
+                    else { "sliding_attention".to_string() }
+                })
+                .collect()
+        }
+    } else {
+        (0..num_hidden_layers)
+            .map(|i| {
+                if (i + 1) % 6 == 0 { "full_attention".to_string() }
+                else { "sliding_attention".to_string() }
+            })
+            .collect()
+    };
 
     Ok(Gemma4TextConfig {
         attention_bias: false,
@@ -126,7 +167,7 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         final_logit_softcapping: get_f64(&["gemma4.final_logit_softcapping"]),
         tie_word_embeddings: true,
         layer_types,
-        rope_parameters: None, // Use defaults
+        rope_parameters,
         enable_moe_block: get_u32(&["gemma4.expert_count"]).map(|n| n > 0).unwrap_or(false),
         num_experts: get_u32(&["gemma4.expert_count"]),
         top_k_experts: get_u32(&["gemma4.expert_used_count"]),
