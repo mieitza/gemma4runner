@@ -361,6 +361,16 @@ impl LayerWeights {
                 .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
                 .transpose(1, 2)?;
 
+            // V norm — RMS norm without learned weight (with_scale=False in HuggingFace,
+            // raw ggml_rms_norm in llama.cpp). Normalizes each value head vector.
+            let v = {
+                let v_f32 = v.to_dtype(DType::F32)?;
+                let sq = v_f32.sqr()?;
+                let mean_sq = (sq.sum_keepdim(D::Minus1)? / self.head_dim as f64)?;
+                let rms = (mean_sq + self.rms_norm_eps as f64)?.sqrt()?;
+                v_f32.broadcast_div(&rms)?.to_dtype(v.dtype())?
+            };
+
             // K norm
             let k = self.attention_k_norm.forward(&k.contiguous()?)?;
 
@@ -420,10 +430,10 @@ impl LayerWeights {
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 
         // Scaled dot-product attention
-        // Gemma4 uses query_pre_attn_scalar=256, so scale = 1/sqrt(256) = 0.0625
-        // This is the SAME for all layers regardless of head_dim.
-        let scale = 1.0 / (256.0f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        // Gemma4 uses f_attention_scale = 1.0 (no scaling on QK).
+        // Both llama.cpp and HuggingFace set self.scaling = 1.0 for Gemma 4.
+        // The Q/K norms already normalize the vectors, so no 1/sqrt(d) is needed.
+        let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
 
         // Apply mask: eq(0u32)?.where_cond(&neg_inf, &attn_weights)?  — exact gemma3 pattern
         let attn_weights = if let Some(mask) = mask {
