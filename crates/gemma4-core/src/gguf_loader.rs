@@ -98,8 +98,8 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
     // RoPE parameters from GGUF metadata
     let rope_theta_full = get_f64(&["gemma4.rope.freq_base"]).unwrap_or(1000000.0);
     let rope_theta_swa = get_f64(&["gemma4.rope.freq_base_swa"]).unwrap_or(10000.0);
-    let rope_dim_full = get_u32(&["gemma4.rope.dimension_count"]).unwrap_or(global_head_dim);
-    let rope_dim_swa = get_u32(&["gemma4.rope.dimension_count_swa"]).unwrap_or(head_dim);
+    let _rope_dim_full = get_u32(&["gemma4.rope.dimension_count"]).unwrap_or(global_head_dim);
+    let _rope_dim_swa = get_u32(&["gemma4.rope.dimension_count_swa"]).unwrap_or(head_dim);
 
     // The GGUF rope.dimension_count stores the head dim, but the actual rotation
     // is controlled by rope_freqs.weight (freq_factors). For Gemma4 E4B,
@@ -125,7 +125,7 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
     // The pattern is stored as an array of booleans: true = sliding, false = full
     let layer_types: Vec<String> = if let Some(val) = metadata.get("gemma4.attention.sliding_window_pattern") {
         // Try to parse as boolean array
-        if let Ok(arr_str) = val.to_string() {
+        if let Ok(_arr_str) = val.to_string() {
             // Fallback: generate from num_hidden_layers with default pattern
             (0..num_hidden_layers)
                 .map(|i| {

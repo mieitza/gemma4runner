@@ -173,6 +173,7 @@ impl RotaryEmbedding {
         Ok((emb, rotary_dim))
     }
 
+    #[allow(dead_code)]
     fn apply_rotary_emb_qkv(
         &self,
         q: &Tensor,
