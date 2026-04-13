@@ -93,15 +93,15 @@ fn main() -> Result<()> {
     let gate_out = gate_matmul.forward(&normed)?;
     print_stats("After FFN gate (blk.0)", &gate_out);
 
-    // Run with just BOS token [2] for comparison with llama.cpp
-    println!("\n=== Single BOS token forward pass ===");
-    let bos_ids = Tensor::new(&[2u32], &device)?.unsqueeze(0)?;
+    // Full chat prompt: <bos><|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n
+    println!("\n=== Full chat prompt forward pass ===");
+    let full_ids = Tensor::new(&[2u32, 105, 2364, 107, 3689, 563, 236743, 236778, 236862, 236778, 236881, 106, 107, 105, 4368, 107], &device)?.unsqueeze(0)?;
     let mut q_model = gemma4_core::quantized_model::QuantizedGemmaModel::new(cfg, &gguf, &device)?;
     let mut cache = gemma4_core::kv_cache::KvCache::new(&cfg.layer_types, cfg.sliding_window);
-    let logits_bos = q_model.forward(&bos_ids, &mut cache, 0)?;
-    print_stats("BOS logits", &logits_bos);
+    let logits_full = q_model.forward(&full_ids, &mut cache, 0)?;
+    print_stats("Full prompt logits", &logits_full);
 
-    let logits_flat = logits_bos.squeeze(0)?;
+    let logits_flat = logits_full.squeeze(0)?;
     let logits_vec: Vec<f32> = logits_flat.to_vec1()?;
     let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
