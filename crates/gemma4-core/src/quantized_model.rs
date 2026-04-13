@@ -471,7 +471,10 @@ impl LayerWeights {
         // Gemma4 uses f_attention_scale = 1.0 (no scaling on QK).
         // Both llama.cpp and HuggingFace set self.scaling = 1.0 for Gemma 4.
         // The Q/K norms already normalize the vectors, so no 1/sqrt(d) is needed.
-        let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
+        // .contiguous() required for Metal/CUDA GPU kernels after transpose/cat/narrow.
+        let q = q.contiguous()?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;
+        let attn_weights = q.matmul(&k_t)?;
 
         // Apply mask: eq(0u32)?.where_cond(&neg_inf, &attn_weights)?  — exact gemma3 pattern
         let attn_weights = if let Some(mask) = mask {
@@ -483,10 +486,12 @@ impl LayerWeights {
         };
 
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let v = v.contiguous()?;
         let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output
             .transpose(1, 2)?
+            .contiguous()?
             .reshape((b_sz, seq_len, self.q_dim))?;
 
         self.attention_wo.forward(&attn_output)
