@@ -57,13 +57,18 @@ fn main() -> Result<()> {
     let input_norm_w = gguf.tensor("blk.0.attn_norm.weight", &device)?.dequantize(&device)?;
     print_stats("blk.0.attn_norm.weight", &input_norm_w);
 
-    // Apply input layernorm manually
-    let x = &embedded;
-    let x_f32 = x.to_dtype(DType::F32)?;
-    let variance = (&x_f32 * &x_f32)?.mean_keepdim(D::Minus1)?;
+    // Apply input layernorm using candle's rms_norm (same as QRmsNorm)
+    let normed = candle_nn::ops::rms_norm(&embedded, &input_norm_w, 1e-6)?;
+    print_stats("After input_layernorm (rms_norm)", &normed);
+
+    // Also try with manual variance computation for comparison
+    let x_f32 = embedded.to_dtype(DType::F32)?;
+    let hidden_size = embedded.dim(D::Minus1)?;
+    let variance_sum = (&x_f32 * &x_f32)?.sum_keepdim(D::Minus1)?;
+    let variance = (variance_sum / hidden_size as f64)?;
     let x_norm = x_f32.broadcast_div(&(variance + 1e-6)?.sqrt()?)?;
-    let normed = x_norm.broadcast_mul(&input_norm_w)?;
-    print_stats("After input_layernorm", &normed);
+    let normed_manual = x_norm.broadcast_mul(&input_norm_w)?;
+    print_stats("After input_layernorm (manual)", &normed_manual);
 
     // Load Q projection and apply
     let q_weight = gguf.tensor("blk.0.attn_q.weight", &device)?;

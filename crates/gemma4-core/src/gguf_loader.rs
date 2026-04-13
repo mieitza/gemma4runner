@@ -101,9 +101,11 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
     let rope_dim_full = get_u32(&["gemma4.rope.dimension_count"]).unwrap_or(global_head_dim);
     let rope_dim_swa = get_u32(&["gemma4.rope.dimension_count_swa"]).unwrap_or(head_dim);
 
-    // Gemma 4 uses partial_rotary_factor=0.25 for global/full attention layers.
-    // The GGUF rope.dimension_count refers to the head dim, not the rotary dim.
-    // For sliding layers, full rotation is used (factor=1.0).
+    // The GGUF rope.dimension_count stores the head dim, but the actual rotation
+    // is controlled by rope_freqs.weight (freq_factors). For Gemma4 E4B,
+    // rope_freqs has 64 entries of 1.0 (rotate) and 192 of 1e30 (no-op),
+    // effectively implementing partial_rotary_factor=0.25 (128/512 dims rotated).
+    // We handle this directly via partial_rotary_factor rather than freq_factors.
     let partial_rotary_factor = 0.25;
 
     let rope_parameters = Some(crate::config::RopeParameters {
@@ -115,7 +117,7 @@ fn config_from_metadata(metadata: &std::collections::HashMap<String, gguf_file::
         sliding_attention: Some(crate::config::RopeLayerParams {
             rope_theta: Some(rope_theta_swa),
             rope_type: Some("default".to_string()),
-            partial_rotary_factor: None,
+            partial_rotary_factor: None, // sliding layers use full rotation
         }),
     });
 

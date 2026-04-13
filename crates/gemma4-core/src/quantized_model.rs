@@ -262,6 +262,9 @@ struct LayerWeights {
 
     neg_inf: Tensor,
 
+    // RMS norm epsilon (for V norm which has no learned weight)
+    rms_norm_eps: f32,
+
     // KV cache
     kv_cache: Option<(Tensor, Tensor)>,
 
@@ -299,9 +302,9 @@ impl LayerWeights {
                 .collect()
         };
         let mask = Tensor::from_slice(&mask, (seq_len, seq_len), device)?;
-        // For cached tokens, prepend zeros (allow attending to all cached positions)
+        // For cached tokens, prepend ones (allow attending to all cached positions)
         let mask = if index_pos > 0 {
-            let mask0 = Tensor::zeros((seq_len, index_pos), DType::U32, device)?;
+            let mask0 = Tensor::ones((seq_len, index_pos), DType::U32, device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
         } else {
             mask
@@ -337,6 +340,8 @@ impl LayerWeights {
         let q = self.attention_q_norm.forward(&q.contiguous()?)?;
         let k = self.attention_k_norm.forward(&k.contiguous()?)?;
 
+        // V normalization — RMSNorm without learned weight (Gemma4-specific)
+        // Formula: v / sqrt(mean(v^2) + eps)
         // RoPE — handle partial rotation for global layers
         let (q, k) = if self.rotary_dim < self.head_dim {
             let q_rot = q.narrow(D::Minus1, 0, self.rotary_dim)?;
@@ -386,7 +391,9 @@ impl LayerWeights {
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 
         // Scaled dot-product attention
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Gemma4 uses query_pre_attn_scalar=256, so scale = 1/sqrt(256) = 0.0625
+        // This is the SAME for all layers regardless of head_dim.
+        let scale = 1.0 / (256.0f64).sqrt();
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
         // Apply mask: eq(0u32)?.where_cond(&neg_inf, &attn_weights)?  — exact gemma3 pattern
@@ -565,6 +572,7 @@ impl QuantizedGemmaModel {
                 rotary_embedding,
                 rotary_dim,
                 neg_inf: neg_inf.clone(),
+                rms_norm_eps: cfg.rms_norm_eps as f32,
                 kv_cache: None,
                 ple_gate,
                 ple_proj,
@@ -605,6 +613,7 @@ impl QuantizedGemmaModel {
         };
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+
             // Attention mask
             let attention_mask = if seq_len == 1 {
                 None
@@ -627,8 +636,8 @@ impl QuantizedGemmaModel {
             let x = (x + residual)?;
 
             // PLE sub-block (only for E4B/E2B)
-            let x = if let (Some(gate), Some(proj), Some(post_norm), Some(scale)) =
-                (&layer.ple_gate, &layer.ple_proj, &layer.ple_post_norm, &layer.layer_output_scale)
+            let x = if let (Some(gate), Some(proj), Some(post_norm)) =
+                (&layer.ple_gate, &layer.ple_proj, &layer.ple_post_norm)
             {
                 if let Some(ref pli) = per_layer_inputs {
                     let ple_input = pli.narrow(2, layer_idx, 1)?.squeeze(2)?;
@@ -638,11 +647,17 @@ impl QuantizedGemmaModel {
                     let gated = (gated * ple_input)?;
                     let projected = proj.forward(&gated)?;
                     let normed = post_norm.forward(&projected)?;
-                    let x = (residual + normed)?;
-                    x.broadcast_mul(scale)?
+                    (residual + normed)?
                 } else {
                     x
                 }
+            } else {
+                x
+            };
+
+            // Layer output scale — applied unconditionally after PLE (matches HuggingFace)
+            let x = if let Some(scale) = &layer.layer_output_scale {
+                x.broadcast_mul(scale)?
             } else {
                 x
             };
