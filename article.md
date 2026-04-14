@@ -304,11 +304,40 @@ The GGUF file contains K/V projection weights for all 42 layers. A reasonable pe
 
 The Gemma 4 technical report describes the architecture at a high level, but the implementation details -- V-norm without learned weight, attention scale of 1.0, KV sharing -- require reading the actual code in HuggingFace transformers or llama.cpp. The paper won't tell you that `scale=1.0` because Q and K are already RMS-normalized.
 
+## The Plot Twist: Why Not Both?
+
+After getting the pure Rust candle backend working correctly at ~6 tok/s on CPU, I asked myself an obvious question: *why is llama.cpp so much faster on the same hardware?*
+
+The answer is that llama.cpp has ~5,000 lines of hand-tuned Metal compute shaders for quantized matrix multiplication. Candle's `QMatMul` runs quantized operations on CPU with SIMD, even when the Metal feature is enabled. Only the non-quantized operations (attention matmul, softmax) run on GPU, and the CPU-GPU transfers for every layer eat most of the benefit.
+
+So I did what any pragmatic engineer would do: I added `llama-cpp-2` as an alternative backend, wrapped behind a feature flag. The same binary, the same API, the same streaming -- just a different engine under the hood.
+
+```bash
+# Pure Rust (candle): ~14 tok/s on Metal
+cargo build --release --features metal
+
+# llama.cpp backend: ~36 tok/s on Metal
+cargo build --release --features llama-cpp-metal
+```
+
+The performance results tell the story:
+
+| Backend | 200 tokens | tok/s |
+|---------|-----------|-------|
+| Candle CPU | ~35s | 5.7 |
+| Candle Metal | 13.9s | 14.5 |
+| **llama.cpp Metal** | **5.5s** | **36.1** |
+
+A `--backend` CLI flag lets users choose: `auto` (default -- uses llama.cpp for GGUF when available), `candle` (pure Rust, no C++ dependencies), or `llama-cpp` (maximum performance).
+
+The candle backend remains valuable: it's pure Rust, compiles anywhere, and taught me everything about Gemma 4's architecture. The llama.cpp backend is what you'd deploy in production.
+
 ## The Stack
 
 For anyone who wants to build something similar:
 
-- **[candle](https://github.com/huggingface/candle)**: Rust tensor library from HuggingFace. Supports CPU, Metal, CUDA, and GGUF quantized tensors. The `QMatMul` type handles quantized matrix multiplication.
+- **[candle](https://github.com/huggingface/candle)**: Rust tensor library from HuggingFace. Supports CPU, Metal, CUDA, and GGUF quantized tensors. Great for understanding model internals.
+- **[llama-cpp-2](https://crates.io/crates/llama-cpp-2)**: Safe Rust bindings to llama.cpp. When you need production performance with Metal/CUDA.
 - **[Axum](https://github.com/tokio-rs/axum)**: HTTP framework. Its `Sse` type makes SSE streaming straightforward.
 - **[tokenizers](https://github.com/huggingface/tokenizers)**: The same tokenizer library that powers HuggingFace's Python ecosystem, with Rust bindings.
 - **[clap](https://github.com/clap-rs/clap)**: CLI argument parsing with derive macros.
