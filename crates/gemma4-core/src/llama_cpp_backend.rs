@@ -10,6 +10,7 @@ pub mod backend {
     use std::path::Path;
 
     use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::context::LlamaContext;
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
@@ -20,6 +21,19 @@ pub mod backend {
 
     use crate::chat_template::{ChatFormatOptions, ChatMessage, ToolDef};
     use crate::sampling::SamplingParams;
+
+    /// Holds the live llama.cpp context and position counter so that
+    /// generation can be continued after a tool-call round without
+    /// rebuilding the KV cache from scratch.
+    pub struct GenerationState<'model> {
+        pub ctx: LlamaContext<'model>,
+        /// Total number of tokens that have been decoded into the KV cache
+        /// (prompt + all generated tokens so far).
+        pub n_decoded: usize,
+        /// The last `LlamaBatch` used — kept alive so the sampler can
+        /// reference its logits index on the next `sample` call.
+        pub batch: LlamaBatch<'model>,
+    }
 
     /// Wraps a llama.cpp model + context for inference.
     ///
@@ -163,21 +177,42 @@ pub mod backend {
         /// Calls `on_token` for each generated token string.  Return `false`
         /// from the callback to stop generation early.
         ///
-        /// Returns the full list of generated token IDs.
+        /// Returns the full list of generated token IDs.  If you do not need
+        /// to continue generation after a tool call, simply ignore the second
+        /// element of the tuple.
         pub fn generate_streaming(
             &self,
             prompt_text: &str,
             params: &SamplingParams,
-            mut on_token: impl FnMut(LlamaToken, &str) -> bool,
+            on_token: impl FnMut(LlamaToken, &str) -> bool,
         ) -> Result<Vec<LlamaToken>> {
+            let (generated, _state) =
+                self.generate_streaming_with_state(prompt_text, params, on_token)?;
+            Ok(generated)
+        }
+
+        /// Like [`generate_streaming`](Self::generate_streaming) but also
+        /// returns the live [`GenerationState`] so the caller can feed
+        /// additional tokens (e.g. a tool response) and continue sampling
+        /// without rebuilding the KV cache.
+        pub fn generate_streaming_with_state<'a>(
+            &'a self,
+            prompt_text: &str,
+            params: &SamplingParams,
+            mut on_token: impl FnMut(LlamaToken, &str) -> bool,
+        ) -> Result<(Vec<LlamaToken>, GenerationState<'a>)> {
             // The prompt already contains <bos> from our chat template, so
             // don't let llama.cpp add another one.
             let prompt_tokens = self.tokenize(prompt_text, false)?;
             let prompt_len = prompt_tokens.len();
             tracing::debug!("llama.cpp prompt: {} tokens", prompt_len);
 
-            // Create a fresh context for this request
-            let ctx_size = std::cmp::max(self.n_ctx, (prompt_len + params.max_tokens) as u32);
+            // Create a fresh context for this request.  We size it large
+            // enough for the prompt + several tool-call rounds.
+            let ctx_size = std::cmp::max(
+                self.n_ctx,
+                (prompt_len + params.max_tokens * 3) as u32,
+            );
             let n_threads = num_threads();
             let ctx_params = LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(ctx_size))
@@ -236,7 +271,103 @@ pub mod backend {
                 n_decoded += 1;
             }
 
-            Ok(generated)
+            let state = GenerationState {
+                ctx,
+                n_decoded,
+                batch,
+            };
+            Ok((generated, state))
+        }
+
+        /// Continue generation after injecting additional text (e.g. a tool
+        /// response) into the existing KV cache.
+        ///
+        /// This tokenizes `continuation_text`, decodes those tokens into the
+        /// existing context (extending the KV cache), then resumes the
+        /// sampling loop.  The context is **not** recreated, avoiding the
+        /// segfault that occurs when llama.cpp contexts are destroyed and
+        /// rebuilt mid-conversation.
+        ///
+        /// Returns `(new_generated_tokens, updated_state)`.
+        pub fn continue_generation<'a>(
+            &'a self,
+            mut state: GenerationState<'a>,
+            continuation_text: &str,
+            params: &SamplingParams,
+            mut on_token: impl FnMut(LlamaToken, &str) -> bool,
+        ) -> Result<(Vec<LlamaToken>, GenerationState<'a>)> {
+            // Tokenize just the continuation (no BOS -- we are mid-sequence).
+            let cont_tokens = self.tokenize(continuation_text, false)?;
+            let cont_len = cont_tokens.len();
+            tracing::debug!(
+                "llama.cpp continue: injecting {} tokens at position {}",
+                cont_len,
+                state.n_decoded,
+            );
+
+            if cont_len == 0 {
+                return Ok((Vec::new(), state));
+            }
+
+            // Feed continuation tokens into the existing KV cache.
+            // We process them in a single batch.
+            let batch_size = cont_len.max(512);
+            let mut batch = LlamaBatch::new(batch_size, 1);
+            for (i, &token) in cont_tokens.iter().enumerate() {
+                let is_last = i == cont_len - 1;
+                let pos = (state.n_decoded + i) as i32;
+                batch
+                    .add(token, pos, &[0], is_last)
+                    .context("Failed to add continuation token to batch")?;
+            }
+            state
+                .ctx
+                .decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("Continuation decode failed: {}", e))?;
+            state.n_decoded += cont_len;
+
+            // Resume sampling loop.
+            let mut sampler = Self::build_sampler(params);
+            // Seed the sampler with the continuation tokens so that
+            // repetition penalties account for them.
+            sampler.accept_many(&cont_tokens);
+
+            let mut generated: Vec<LlamaToken> = Vec::new();
+
+            for _ in 0..params.max_tokens {
+                let new_token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
+                sampler.accept(new_token);
+
+                if self.is_eog(new_token) {
+                    break;
+                }
+
+                #[allow(deprecated)]
+                let text = self
+                    .model
+                    .token_to_str(new_token, Special::Tokenize)
+                    .unwrap_or_default();
+
+                generated.push(new_token);
+
+                if !on_token(new_token, &text) {
+                    break;
+                }
+
+                // Prepare next decode step
+                batch.clear();
+                batch
+                    .add(new_token, state.n_decoded as i32, &[0], true)
+                    .context("Failed to add token to batch")?;
+                state
+                    .ctx
+                    .decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("Decode step failed: {}", e))?;
+                state.n_decoded += 1;
+            }
+
+            state.batch = batch;
+            Ok((generated, state))
         }
     }
 

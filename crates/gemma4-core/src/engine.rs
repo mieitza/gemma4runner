@@ -428,10 +428,7 @@ fn process_request_llama_cpp(
     request: &InferenceRequest,
     sandbox: &Option<Sandbox>,
 ) -> Result<()> {
-    // Build the initial messages list.  When a sandbox is active we may
-    // need to inject sandbox tool definitions *and* loop back after tool
-    // execution, so we work with a mutable messages vec.
-    let mut messages: Vec<ChatMessage> = match &request.input {
+    let messages: Vec<ChatMessage> = match &request.input {
         InferenceInput::Chat(msgs) => msgs.clone(),
         InferenceInput::Raw(text) => {
             vec![ChatMessage {
@@ -443,10 +440,7 @@ fn process_request_llama_cpp(
         }
     };
 
-    // Use only user-supplied tools (sandbox endpoints are REST-based,
-    // not auto-injected into the model prompt)
     let tools = request.tools.clone();
-
     let tx = &request.response_tx;
     let mut total_prompt_tokens = 0usize;
     let mut total_completion_tokens = 0usize;
@@ -454,28 +448,135 @@ fn process_request_llama_cpp(
     // Maximum rounds of tool-call execution to prevent infinite loops
     const MAX_TOOL_ROUNDS: usize = 10;
 
-    for round in 0..=MAX_TOOL_ROUNDS {
-        let prompt = llama.format_prompt(&messages, &tools, request.include_thinking);
+    // --- First round: full prompt, creates context + KV cache ---
+    let prompt = llama.format_prompt(&messages, &tools, request.include_thinking);
+    let prompt_token_count = llama
+        .tokenize(&prompt, false)
+        .map(|t| t.len())
+        .unwrap_or(0);
+    total_prompt_tokens += prompt_token_count;
 
-        let prompt_tokens = llama
-            .tokenize(&prompt, false)
+    let mut think_parser =
+        crate::think_parser::ThinkParser::new(request.include_thinking);
+    let mut all_text = String::new();
+    let mut completion_tokens = 0usize;
+
+    let (generated, mut gen_state) = llama.generate_streaming_with_state(
+        &prompt,
+        &request.sampling,
+        |_token, text| {
+            completion_tokens += 1;
+            all_text.push_str(text);
+            for event in think_parser.feed(text) {
+                match event {
+                    crate::think_parser::ThinkEvent::Content(s) => {
+                        let _ = tx.send(InferenceEvent::Token(s));
+                    }
+                    crate::think_parser::ThinkEvent::Thinking(s) => {
+                        let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                    }
+                }
+            }
+            true
+        },
+    )?;
+    // Account for the generated tokens in the KV-cache position counter.
+    // generate_streaming_with_state already tracks n_decoded correctly for
+    // prompt + decoded tokens, but it does not count the *sampled* tokens
+    // that were fed back one-by-one.  n_decoded is already correct.
+    let _ = generated; // consumed
+
+    for event in think_parser.flush() {
+        match event {
+            crate::think_parser::ThinkEvent::Content(s) => {
+                let _ = tx.send(InferenceEvent::Token(s));
+            }
+            crate::think_parser::ThinkEvent::Thinking(s) => {
+                let _ = tx.send(InferenceEvent::ThinkingToken(s));
+            }
+        }
+    }
+    total_completion_tokens += completion_tokens;
+
+    // --- Tool-call loop: reuse existing KV cache ---
+    for round in 0..MAX_TOOL_ROUNDS {
+        if !crate::tool_parser::has_tool_calls(&all_text) {
+            break;
+        }
+
+        let parsed = crate::tool_parser::parse_tool_calls(&all_text);
+        let has_sandbox_calls = parsed
+            .iter()
+            .any(|tc| Sandbox::is_sandbox_tool(&tc.name));
+
+        if !has_sandbox_calls || sandbox.is_none() {
+            // Non-sandbox tool calls: report to caller and finish.
+            if !parsed.is_empty() {
+                let _ = tx.send(InferenceEvent::ToolCalls(parsed));
+                let _ = tx.send(InferenceEvent::Usage(UsageStats {
+                    prompt_tokens: total_prompt_tokens,
+                    completion_tokens: total_completion_tokens,
+                }));
+                let _ = tx.send(InferenceEvent::Done(FinishReason::ToolCalls));
+                return Ok(());
+            }
+            break;
+        }
+
+        // --- Execute sandbox tool calls and build continuation text ---
+        let sb = sandbox.as_ref().unwrap();
+
+        // Build the continuation text that will be injected into the
+        // existing KV cache.  Format:
+        //   <turn|>\n                          (close assistant turn)
+        //   <|turn>tool\n<|tool_response>id:call_0\nRESULT<tool_response|><turn|>\n
+        //   ...
+        //   <|turn>model\n                     (begin new model turn)
+        let mut continuation = String::from("<turn|>\n");
+        for (i, tc) in parsed.iter().enumerate() {
+            if !Sandbox::is_sandbox_tool(&tc.name) {
+                continue;
+            }
+            let result = match sb.dispatch_tool_call(&tc.name, &tc.arguments) {
+                Ok(r) => r,
+                Err(e) => format!("Error: {}", e),
+            };
+
+            tracing::info!(
+                "Sandbox tool [round {}] {}({}) => {} bytes",
+                round,
+                tc.name,
+                tc.arguments,
+                result.len(),
+            );
+
+            continuation.push_str(&format!(
+                "<|turn>tool\n<|tool_response>id:call_{}\n{}<tool_response|><turn|>\n",
+                i, result,
+            ));
+        }
+        continuation.push_str("<|turn>model\n");
+
+        let cont_token_count = llama
+            .tokenize(&continuation, false)
             .map(|t| t.len())
             .unwrap_or(0);
-        total_prompt_tokens += prompt_tokens;
+        total_prompt_tokens += cont_token_count;
 
+        // Continue generation by feeding the tool-response tokens into
+        // the existing context.
         let mut think_parser =
             crate::think_parser::ThinkParser::new(request.include_thinking);
-        let mut all_text = String::new();
-        let mut completion_tokens = 0usize;
+        all_text.clear();
+        completion_tokens = 0;
 
-        let _generated = llama.generate_streaming(
-            &prompt,
+        let (new_generated, new_state) = llama.continue_generation(
+            gen_state,
+            &continuation,
             &request.sampling,
             |_token, text| {
                 completion_tokens += 1;
                 all_text.push_str(text);
-
-                // Stream tokens to the caller
                 for event in think_parser.feed(text) {
                     match event {
                         crate::think_parser::ThinkEvent::Content(s) => {
@@ -489,8 +590,9 @@ fn process_request_llama_cpp(
                 true
             },
         )?;
+        gen_state = new_state;
+        let _ = new_generated;
 
-        // Flush remaining think-parser buffer
         for event in think_parser.flush() {
             match event {
                 crate::think_parser::ThinkEvent::Content(s) => {
@@ -501,100 +603,34 @@ fn process_request_llama_cpp(
                 }
             }
         }
-
         total_completion_tokens += completion_tokens;
-
-        // Check for tool calls
-        if crate::tool_parser::has_tool_calls(&all_text) {
-            let parsed = crate::tool_parser::parse_tool_calls(&all_text);
-            let sandbox_calls: Vec<_> = parsed
-                .iter()
-                .filter(|tc| Sandbox::is_sandbox_tool(&tc.name))
-                .collect();
-
-            if !sandbox_calls.is_empty() && sandbox.is_some() && round < MAX_TOOL_ROUNDS {
-                let sb = sandbox.as_ref().unwrap();
-
-                // Add the assistant message with tool calls to the
-                // conversation
-                let call_infos: Vec<crate::chat_template::ToolCallInfo> = parsed
-                    .iter()
-                    .map(|tc| crate::chat_template::ToolCallInfo {
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.to_string(),
-                    })
-                    .collect();
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: crate::tool_parser::content_before_tool_calls(&all_text)
-                        .unwrap_or_default(),
-                    tool_calls: Some(call_infos),
-                    tool_call_id: None,
-                });
-
-                // Execute each sandbox tool call and add tool response
-                // messages
-                for (i, tc) in parsed.iter().enumerate() {
-                    if Sandbox::is_sandbox_tool(&tc.name) {
-                        let result = match sb.dispatch_tool_call(&tc.name, &tc.arguments) {
-                            Ok(r) => r,
-                            Err(e) => format!("Error: {}", e),
-                        };
-
-                        tracing::info!(
-                            "Sandbox tool {}({}) => {} bytes",
-                            tc.name,
-                            tc.arguments,
-                            result.len()
-                        );
-
-                        messages.push(ChatMessage {
-                            role: "tool".to_string(),
-                            content: result,
-                            tool_calls: None,
-                            tool_call_id: Some(format!("call_{}", i)),
-                        });
-                    }
-                }
-
-                // Loop back for another generation round
-                continue;
-            }
-
-            // No sandbox execution (or non-sandbox tool calls) -- report
-            // to caller as usual
-            if !parsed.is_empty() {
-                let _ = tx.send(InferenceEvent::ToolCalls(parsed));
-                let _ = tx.send(InferenceEvent::Usage(UsageStats {
-                    prompt_tokens: total_prompt_tokens,
-                    completion_tokens: total_completion_tokens,
-                }));
-                let _ = tx.send(InferenceEvent::Done(FinishReason::ToolCalls));
-                return Ok(());
-            }
-        }
-
-        // No tool calls (or all executed) -- we're done
-        let finish_reason = if completion_tokens < request.sampling.max_tokens {
-            FinishReason::Stop
-        } else {
-            FinishReason::Length
-        };
-
-        let _ = tx.send(InferenceEvent::Usage(UsageStats {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-        }));
-        let _ = tx.send(InferenceEvent::Done(finish_reason));
-        return Ok(());
     }
 
-    // If we got here, we hit the tool-call round limit
-    tracing::warn!("Sandbox tool-call loop hit maximum rounds ({})", MAX_TOOL_ROUNDS);
+    // Check if the final round's output still contains tool calls
+    // (non-sandbox or we hit the round limit).
+    if crate::tool_parser::has_tool_calls(&all_text) {
+        let parsed = crate::tool_parser::parse_tool_calls(&all_text);
+        if !parsed.is_empty() {
+            let _ = tx.send(InferenceEvent::ToolCalls(parsed));
+            let _ = tx.send(InferenceEvent::Usage(UsageStats {
+                prompt_tokens: total_prompt_tokens,
+                completion_tokens: total_completion_tokens,
+            }));
+            let _ = tx.send(InferenceEvent::Done(FinishReason::ToolCalls));
+            return Ok(());
+        }
+    }
+
+    let finish_reason = if completion_tokens < request.sampling.max_tokens {
+        FinishReason::Stop
+    } else {
+        FinishReason::Length
+    };
+
     let _ = tx.send(InferenceEvent::Usage(UsageStats {
         prompt_tokens: total_prompt_tokens,
         completion_tokens: total_completion_tokens,
     }));
-    let _ = tx.send(InferenceEvent::Done(FinishReason::Stop));
+    let _ = tx.send(InferenceEvent::Done(finish_reason));
     Ok(())
 }
