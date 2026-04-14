@@ -109,7 +109,7 @@ impl Sandbox {
         fs::create_dir_all(&workspace)
             .with_context(|| format!("Failed to create sandbox workspace: {}", workspace.display()))?;
 
-        let python_path = if level == SandboxLevel::Packages {
+        let python_path = if level == SandboxLevel::Packages || level == SandboxLevel::Full {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
             let venv_python = format!("{}/sandbox-venv/bin/python3", home);
             if Path::new(&venv_python).exists() {
