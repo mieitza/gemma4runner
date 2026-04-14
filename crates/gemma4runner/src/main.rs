@@ -51,8 +51,14 @@ async fn main() -> Result<()> {
                 &model_path, dev, queue_depth, backend_choice, sandbox_level,
             )?;
 
+            // Create sandbox for API endpoints if enabled
+            let sandbox = sandbox_level.map(|level| {
+                let session_id = uuid::Uuid::new_v4().to_string();
+                gemma4_core::sandbox::Sandbox::new(level, &session_id)
+            }).transpose()?;
+
             tracing::info!("Starting server on {}:{}", host, port);
-            gemma4_api::server::start_server(engine, &host, port, api_key).await?;
+            gemma4_api::server::start_server(engine, &host, port, api_key, sandbox).await?;
             Ok(())
         }
         Commands::Info { model, hf_token } => {
