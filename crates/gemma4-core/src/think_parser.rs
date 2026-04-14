@@ -26,7 +26,7 @@ pub struct ThinkParser {
 }
 
 const THINK_OPEN: &str = "<|channel>thought\n";
-const THINK_CLOSE: &str = "\n<channel|>";
+const THINK_CLOSE: &str = "<channel|>";
 
 impl ThinkParser {
     /// Create a new parser.
