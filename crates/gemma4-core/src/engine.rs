@@ -443,16 +443,9 @@ fn process_request_llama_cpp(
         }
     };
 
-    // Merge sandbox tool definitions with any user-supplied tools
-    let mut tools = request.tools.clone();
-    if let Some(sb) = &sandbox {
-        let sandbox_tools = Sandbox::tool_definitions(sb.level());
-        for st in &sandbox_tools {
-            if !tools.iter().any(|t| t.name == st.name) {
-                tools.push(st.clone());
-            }
-        }
-    }
+    // Use only user-supplied tools (sandbox endpoints are REST-based,
+    // not auto-injected into the model prompt)
+    let tools = request.tools.clone();
 
     let tx = &request.response_tx;
     let mut total_prompt_tokens = 0usize;
