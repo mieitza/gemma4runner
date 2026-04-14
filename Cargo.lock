@@ -1426,6 +1426,7 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -15,5 +15,6 @@ pub mod engine;
 pub mod think_parser;
 pub mod tool_parser;
 pub mod multimodal;
+pub mod sandbox;
 #[cfg(feature = "llama-cpp")]
 pub mod llama_cpp_backend;

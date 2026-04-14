@@ -9,6 +9,7 @@ use crate::config::Gemma4Config;
 use crate::kv_cache::KvCache;
 use crate::loader;
 use crate::sampling::{LogitsProcessor, SamplingParams};
+use crate::sandbox::{Sandbox, SandboxLevel};
 use crate::tokenizer::GemmaTokenizer;
 
 #[derive(Debug)]
@@ -160,7 +161,7 @@ pub fn device_from_string(s: &str) -> Result<Device> {
 }
 
 pub fn start_engine(model_path: &Path, device: Device, queue_depth: usize) -> Result<EngineHandle> {
-    start_engine_with_backend(model_path, device, queue_depth, BackendChoice::Auto)
+    start_engine_with_backend(model_path, device, queue_depth, BackendChoice::Auto, None)
 }
 
 pub fn start_engine_with_backend(
@@ -168,7 +169,17 @@ pub fn start_engine_with_backend(
     device: Device,
     queue_depth: usize,
     backend_choice: BackendChoice,
+    sandbox_level: Option<SandboxLevel>,
 ) -> Result<EngineHandle> {
+    // --- Create sandbox if requested ---
+    let sandbox = match sandbox_level {
+        Some(level) => {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let sb = Sandbox::new(level, &session_id)?;
+            Some(sb)
+        }
+        None => None,
+    };
     // --- Decide whether to use the llama.cpp backend ---
     #[cfg(feature = "llama-cpp")]
     let use_llama_cpp = match backend_choice {
@@ -206,7 +217,7 @@ pub fn start_engine_with_backend(
         thread::Builder::new()
             .name("inference-engine-llamacpp".to_string())
             .spawn(move || {
-                engine_loop_llama_cpp(llama, request_rx);
+                engine_loop_llama_cpp(llama, request_rx, sandbox);
             })?;
         return Ok(EngineHandle { request_tx });
     }
@@ -264,6 +275,12 @@ pub fn start_engine_with_backend(
         let config = loaded.config;
         (ModelBackend::Safetensors(loaded.model), tokenizer, config)
     };
+
+    // The candle backend does not yet support sandbox tool execution.
+    if sandbox.is_some() {
+        tracing::warn!("Sandbox is not yet supported with the candle backend; ignoring --sandbox");
+    }
+    drop(sandbox);
 
     let (request_tx, request_rx) = mpsc::sync_channel::<InferenceRequest>(queue_depth);
 
@@ -395,9 +412,10 @@ fn process_request(
 fn engine_loop_llama_cpp(
     llama: crate::llama_cpp_backend::backend::LlamaCppBackend,
     request_rx: mpsc::Receiver<InferenceRequest>,
+    sandbox: Option<Sandbox>,
 ) {
     while let Ok(request) = request_rx.recv() {
-        if let Err(e) = process_request_llama_cpp(&llama, &request) {
+        if let Err(e) = process_request_llama_cpp(&llama, &request, &sandbox) {
             let _ = request.response_tx.send(InferenceEvent::Error(e.to_string()));
         }
     }
@@ -408,82 +426,182 @@ fn engine_loop_llama_cpp(
 fn process_request_llama_cpp(
     llama: &crate::llama_cpp_backend::backend::LlamaCppBackend,
     request: &InferenceRequest,
+    sandbox: &Option<Sandbox>,
 ) -> Result<()> {
-    // Format the prompt using our chat template
-    let prompt = match &request.input {
-        InferenceInput::Chat(messages) => {
-            llama.format_prompt(messages, &request.tools, request.include_thinking)
+    // Build the initial messages list.  When a sandbox is active we may
+    // need to inject sandbox tool definitions *and* loop back after tool
+    // execution, so we work with a mutable messages vec.
+    let mut messages: Vec<ChatMessage> = match &request.input {
+        InferenceInput::Chat(msgs) => msgs.clone(),
+        InferenceInput::Raw(text) => {
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: text.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+            }]
         }
-        InferenceInput::Raw(text) => text.clone(),
     };
 
-    let mut think_parser = crate::think_parser::ThinkParser::new(request.include_thinking);
-    let mut all_text = String::new();
-    let mut completion_tokens = 0usize;
-
-    // Estimate prompt length from the tokenizer for usage stats
-    let prompt_tokens = llama.tokenize(&prompt, false)
-        .map(|t| t.len())
-        .unwrap_or(0);
+    // Merge sandbox tool definitions with any user-supplied tools
+    let mut tools = request.tools.clone();
+    if let Some(ref sb) = sandbox {
+        let sandbox_tools = Sandbox::tool_definitions(sb.level());
+        for st in &sandbox_tools {
+            if !tools.iter().any(|t| t.name == st.name) {
+                tools.push(st.clone());
+            }
+        }
+    }
 
     let tx = &request.response_tx;
+    let mut total_prompt_tokens = 0usize;
+    let mut total_completion_tokens = 0usize;
 
-    let _generated = llama.generate_streaming(
-        &prompt,
-        &request.sampling,
-        |_token, text| {
-            completion_tokens += 1;
-            all_text.push_str(text);
+    // Maximum rounds of tool-call execution to prevent infinite loops
+    const MAX_TOOL_ROUNDS: usize = 10;
 
-            // Feed through the think parser for streaming
-            for event in think_parser.feed(text) {
-                match event {
-                    crate::think_parser::ThinkEvent::Content(s) => {
-                        let _ = tx.send(InferenceEvent::Token(s));
-                    }
-                    crate::think_parser::ThinkEvent::Thinking(s) => {
-                        let _ = tx.send(InferenceEvent::ThinkingToken(s));
+    for round in 0..=MAX_TOOL_ROUNDS {
+        let prompt = llama.format_prompt(&messages, &tools, request.include_thinking);
+
+        let prompt_tokens = llama
+            .tokenize(&prompt, false)
+            .map(|t| t.len())
+            .unwrap_or(0);
+        total_prompt_tokens += prompt_tokens;
+
+        let mut think_parser =
+            crate::think_parser::ThinkParser::new(request.include_thinking);
+        let mut all_text = String::new();
+        let mut completion_tokens = 0usize;
+
+        let _generated = llama.generate_streaming(
+            &prompt,
+            &request.sampling,
+            |_token, text| {
+                completion_tokens += 1;
+                all_text.push_str(text);
+
+                // Stream tokens to the caller
+                for event in think_parser.feed(text) {
+                    match event {
+                        crate::think_parser::ThinkEvent::Content(s) => {
+                            let _ = tx.send(InferenceEvent::Token(s));
+                        }
+                        crate::think_parser::ThinkEvent::Thinking(s) => {
+                            let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                        }
                     }
                 }
-            }
-            true // continue generating
-        },
-    )?;
+                true
+            },
+        )?;
 
-    // Flush remaining think-parser buffer
-    for event in think_parser.flush() {
-        match event {
-            crate::think_parser::ThinkEvent::Content(s) => {
-                let _ = tx.send(InferenceEvent::Token(s));
-            }
-            crate::think_parser::ThinkEvent::Thinking(s) => {
-                let _ = tx.send(InferenceEvent::ThinkingToken(s));
+        // Flush remaining think-parser buffer
+        for event in think_parser.flush() {
+            match event {
+                crate::think_parser::ThinkEvent::Content(s) => {
+                    let _ = tx.send(InferenceEvent::Token(s));
+                }
+                crate::think_parser::ThinkEvent::Thinking(s) => {
+                    let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                }
             }
         }
-    }
 
-    // Determine finish reason
-    // If generate_streaming returned because is_eog was true, the loop
-    // exited naturally.  We infer Stop if completion_tokens < max_tokens.
-    let mut finish_reason = if completion_tokens < request.sampling.max_tokens {
-        FinishReason::Stop
-    } else {
-        FinishReason::Length
-    };
+        total_completion_tokens += completion_tokens;
 
-    // Check for tool calls in the full output
-    if crate::tool_parser::has_tool_calls(&all_text) {
-        let parsed = crate::tool_parser::parse_tool_calls(&all_text);
-        if !parsed.is_empty() {
-            let _ = tx.send(InferenceEvent::ToolCalls(parsed));
-            finish_reason = FinishReason::ToolCalls;
+        // Check for tool calls
+        if crate::tool_parser::has_tool_calls(&all_text) {
+            let parsed = crate::tool_parser::parse_tool_calls(&all_text);
+            let sandbox_calls: Vec<_> = parsed
+                .iter()
+                .filter(|tc| Sandbox::is_sandbox_tool(&tc.name))
+                .collect();
+
+            if !sandbox_calls.is_empty() && sandbox.is_some() && round < MAX_TOOL_ROUNDS {
+                let sb = sandbox.as_ref().unwrap();
+
+                // Add the assistant message with tool calls to the
+                // conversation
+                let call_infos: Vec<crate::chat_template::ToolCallInfo> = parsed
+                    .iter()
+                    .map(|tc| crate::chat_template::ToolCallInfo {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    })
+                    .collect();
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: crate::tool_parser::content_before_tool_calls(&all_text)
+                        .unwrap_or_default(),
+                    tool_calls: Some(call_infos),
+                    tool_call_id: None,
+                });
+
+                // Execute each sandbox tool call and add tool response
+                // messages
+                for (i, tc) in parsed.iter().enumerate() {
+                    if Sandbox::is_sandbox_tool(&tc.name) {
+                        let result = match sb.dispatch_tool_call(&tc.name, &tc.arguments) {
+                            Ok(r) => r,
+                            Err(e) => format!("Error: {}", e),
+                        };
+
+                        tracing::info!(
+                            "Sandbox tool {}({}) => {} bytes",
+                            tc.name,
+                            tc.arguments,
+                            result.len()
+                        );
+
+                        messages.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: result,
+                            tool_calls: None,
+                            tool_call_id: Some(format!("call_{}", i)),
+                        });
+                    }
+                }
+
+                // Loop back for another generation round
+                continue;
+            }
+
+            // No sandbox execution (or non-sandbox tool calls) -- report
+            // to caller as usual
+            if !parsed.is_empty() {
+                let _ = tx.send(InferenceEvent::ToolCalls(parsed));
+                let _ = tx.send(InferenceEvent::Usage(UsageStats {
+                    prompt_tokens: total_prompt_tokens,
+                    completion_tokens: total_completion_tokens,
+                }));
+                let _ = tx.send(InferenceEvent::Done(FinishReason::ToolCalls));
+                return Ok(());
+            }
         }
+
+        // No tool calls (or all executed) -- we're done
+        let finish_reason = if completion_tokens < request.sampling.max_tokens {
+            FinishReason::Stop
+        } else {
+            FinishReason::Length
+        };
+
+        let _ = tx.send(InferenceEvent::Usage(UsageStats {
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+        }));
+        let _ = tx.send(InferenceEvent::Done(finish_reason));
+        return Ok(());
     }
 
+    // If we got here, we hit the tool-call round limit
+    tracing::warn!("Sandbox tool-call loop hit maximum rounds ({})", MAX_TOOL_ROUNDS);
     let _ = tx.send(InferenceEvent::Usage(UsageStats {
-        prompt_tokens,
-        completion_tokens,
+        prompt_tokens: total_prompt_tokens,
+        completion_tokens: total_completion_tokens,
     }));
-    let _ = tx.send(InferenceEvent::Done(finish_reason));
+    let _ = tx.send(InferenceEvent::Done(FinishReason::Stop));
     Ok(())
 }

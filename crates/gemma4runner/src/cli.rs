@@ -22,6 +22,8 @@ pub enum Commands {
         #[arg(long)] queue_depth: Option<usize>,
         /// Inference backend: auto (default), candle, llama-cpp
         #[arg(long, default_value = "auto")] backend: String,
+        /// Code execution sandbox: off (default), locked, packages, full
+        #[arg(long, default_value = "off")] sandbox: String,
     },
     /// Print model details without loading weights
     Info {

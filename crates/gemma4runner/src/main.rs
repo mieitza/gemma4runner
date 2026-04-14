@@ -12,7 +12,7 @@ use std::fs;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve { model, config, host, port, device, hf_token, api_key, log_level, queue_depth, backend } => {
+        Commands::Serve { model, config, host, port, device, hf_token, api_key, log_level, queue_depth, backend, sandbox } => {
             let file_config = match &config {
                 Some(path) => AppConfig::load(&PathBuf::from(path))?,
                 None => AppConfig::default(),
@@ -34,13 +34,21 @@ async fn main() -> Result<()> {
 
             let backend_choice: gemma4_core::engine::BackendChoice = backend.parse()?;
 
+            let sandbox_level: Option<gemma4_core::sandbox::SandboxLevel> = match sandbox.as_str() {
+                "off" | "none" => None,
+                other => Some(other.parse()?),
+            };
+
             let model_path = gemma4_core::loader::resolve_model_source(&model_source, hf_token.as_deref())?;
             let dev = gemma4_core::engine::device_from_string(&device_str)?;
             tracing::info!("Using device: {}, backend: {:?}", device_str, backend_choice);
+            if let Some(ref level) = sandbox_level {
+                tracing::info!("Sandbox enabled: level={}", level);
+            }
 
             tracing::info!("Loading model from {}", model_path.display());
             let engine = gemma4_core::engine::start_engine_with_backend(
-                &model_path, dev, queue_depth, backend_choice,
+                &model_path, dev, queue_depth, backend_choice, sandbox_level,
             )?;
 
             tracing::info!("Starting server on {}:{}", host, port);
