@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gemma4runner</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+#header { padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; }
+#header h1 { font-size: 16px; color: #58a6ff; }
+#header .badge { font-size: 11px; background: #238636; color: #fff; padding: 2px 8px; border-radius: 10px; }
+#header .stats { margin-left: auto; font-size: 12px; color: #8b949e; }
+#chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.msg { max-width: 85%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; word-wrap: break-word; }
+.msg.user { align-self: flex-end; background: #1f6feb; color: #fff; border-bottom-right-radius: 4px; }
+.msg.assistant { align-self: flex-start; background: #161b22; border: 1px solid #30363d; border-bottom-left-radius: 4px; }
+.msg.assistant pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin: 8px 0; overflow-x: auto; position: relative; }
+.msg.assistant code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+.msg.assistant p { margin: 4px 0; }
+.msg.assistant strong { color: #58a6ff; }
+.run-btn { position: absolute; top: 6px; right: 6px; background: #238636; color: #fff; border: none; padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+.run-btn:hover { background: #2ea043; }
+.exec-result { background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin-top: 8px; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+.exec-result.success { border-left: 3px solid #238636; }
+.exec-result.error { border-left: 3px solid #f85149; }
+.thinking { color: #8b949e; font-style: italic; font-size: 13px; border-left: 2px solid #30363d; padding-left: 10px; margin: 4px 0; }
+#input-area { padding: 12px 20px; background: #161b22; border-top: 1px solid #30363d; display: flex; gap: 10px; }
+#input { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px 14px; color: #c9d1d9; font-size: 14px; font-family: inherit; resize: none; outline: none; min-height: 44px; max-height: 120px; }
+#input:focus { border-color: #58a6ff; }
+#send { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 10px 20px; font-size: 14px; cursor: pointer; font-weight: 500; }
+#send:hover { background: #2ea043; }
+#send:disabled { background: #30363d; cursor: not-allowed; }
+.typing { color: #8b949e; font-size: 13px; padding: 8px 16px; }
+.typing::after { content: '...'; animation: dots 1.5s infinite; }
+@keyframes dots { 0%,20% { content: '.'; } 40% { content: '..'; } 60%,100% { content: '...'; } }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>gemma4runner</h1>
+  <span class="badge" id="model-badge">loading...</span>
+  <span class="stats" id="stats"></span>
+</div>
+<div id="chat"></div>
+<div id="input-area">
+  <textarea id="input" placeholder="Message gemma4runner..." rows="1"></textarea>
+  <button id="send" onclick="sendMessage()">Send</button>
+</div>
+
+<script>
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+let messages = [];
+let generating = false;
+
+// Auto-resize textarea
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// Load model info
+fetch('/v1/models').then(r => r.json()).then(d => {
+  document.getElementById('model-badge').textContent = d.data[0]?.id || 'gemma-4';
+});
+
+function updateStats() {
+  fetch('/metrics').then(r => r.json()).then(d => {
+    document.getElementById('stats').textContent =
+      `${d.total_requests} requests | ${d.avg_tokens_per_sec.toFixed(1)} tok/s avg`;
+  }).catch(() => {});
+}
+setInterval(updateStats, 5000);
+updateStats();
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function renderMarkdown(text) {
+  // Code blocks with run button
+  text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+    const l = lang || 'text';
+    const escaped = escapeHtml(code.trim());
+    const id = 'code-' + Math.random().toString(36).substr(2,6);
+    const runnable = ['python','c','cpp','rust','bash','javascript'].includes(l);
+    const runBtn = runnable ? `<button class="run-btn" onclick="runCode('${id}','${l}')">Run</button>` : '';
+    return `<pre>${runBtn}<code id="${id}" data-lang="${l}">${escaped}</code></pre>`;
+  });
+  // Inline code
+  text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Bold
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Italic
+  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  // Line breaks
+  text = text.replace(/\n/g, '<br>');
+  return text;
+}
+
+function addMessage(role, content, thinking) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  let html = '';
+  if (thinking) {
+    html += `<div class="thinking">${escapeHtml(thinking)}</div>`;
+  }
+  html += role === 'user' ? escapeHtml(content) : renderMarkdown(content);
+  div.innerHTML = html;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || generating) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  generating = true;
+  sendBtn.disabled = true;
+
+  messages.push({ role: 'user', content: text });
+  addMessage('user', text);
+
+  // Typing indicator
+  const typing = document.createElement('div');
+  typing.className = 'typing';
+  typing.textContent = 'Thinking';
+  chat.appendChild(typing);
+  chat.scrollTop = chat.scrollHeight;
+
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gemma-4',
+        messages: messages.slice(-10), // last 10 messages for context
+        temperature: 0.7,
+        max_tokens: 1000
+      })
+    });
+    const data = await resp.json();
+    typing.remove();
+
+    if (data.error) {
+      addMessage('assistant', 'Error: ' + data.error.message);
+    } else {
+      const msg = data.choices[0].message;
+      const content = msg.content || '';
+      const thinking = msg.thinking || '';
+      messages.push({ role: 'assistant', content: content });
+      addMessage('assistant', content, thinking);
+    }
+  } catch (e) {
+    typing.remove();
+    addMessage('assistant', 'Connection error: ' + e.message);
+  }
+
+  generating = false;
+  sendBtn.disabled = false;
+  input.focus();
+  updateStats();
+}
+
+async function runCode(id, lang) {
+  const codeEl = document.getElementById(id);
+  const code = codeEl.textContent;
+  const pre = codeEl.closest('pre');
+
+  // Remove existing result if any
+  const existing = pre.parentElement.querySelector('.exec-result');
+  if (existing) existing.remove();
+
+  const btn = pre.querySelector('.run-btn');
+  btn.textContent = 'Running...';
+  btn.disabled = true;
+
+  try {
+    const resp = await fetch('/v1/sandbox/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ language: lang, code: code })
+    });
+    const result = await resp.json();
+
+    const div = document.createElement('div');
+    div.className = 'exec-result ' + (result.exit_code === 0 ? 'success' : 'error');
+    const output = result.stdout || result.stderr || '(no output)';
+    div.textContent = (result.exit_code === 0 ? '$ ' : 'ERROR: ') + output.trim();
+    pre.parentElement.insertBefore(div, pre.nextSibling);
+  } catch (e) {
+    const div = document.createElement('div');
+    div.className = 'exec-result error';
+    div.textContent = 'Failed to execute: ' + e.message;
+    pre.parentElement.insertBefore(div, pre.nextSibling);
+  }
+
+  btn.textContent = 'Run';
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use axum::routing::{get, post};
+use axum::response::Html;
 use axum::Router;
 use gemma4_core::engine::EngineHandle;
 use gemma4_core::sandbox::Sandbox;
@@ -7,12 +8,15 @@ use crate::handlers;
 use crate::metrics::Metrics;
 use crate::middleware::{ApiKey, auth_middleware};
 
+const INDEX_HTML: &str = include_str!("../../../static/index.html");
+
 pub fn build_router(engine: EngineHandle, api_key: Option<String>, metrics: Metrics, sandbox: Option<Arc<Mutex<Sandbox>>>) -> Router {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(handlers::chat::chat_completions))
         .route("/v1/completions", post(handlers::completion::completions))
         .route("/v1/models", get(handlers::models::list_models))
         .route("/health", get(handlers::health::health))
+        .route("/", get(|| async { Html(INDEX_HTML) }))
         .layer(axum::Extension(metrics.clone()))
         .with_state(engine);
 
