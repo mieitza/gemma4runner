@@ -612,27 +612,37 @@ fn process_request_llama_cpp(
         sandbox_executed = true;
         let sb = sandbox.as_ref().unwrap();
 
-        let mut sandbox_results = Vec::new();
+        let mut sandbox_outputs = Vec::new();
         for tc in parsed.iter() {
             if !Sandbox::is_sandbox_tool(&tc.name) {
                 continue;
             }
-            let result = match sb.dispatch_tool_call(&tc.name, &tc.arguments) {
-                Ok(r) => r,
-                Err(e) => format!("Error: {}", e),
-            };
-            tracing::info!(
-                "Sandbox tool [round {}] {}({}) => {} bytes",
-                round, tc.name, tc.arguments, result.len(),
-            );
-            sandbox_results.push(result);
+            // Execute and get just the stdout (the actual data)
+            let code = tc.arguments.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let lang = tc.arguments.get("language").and_then(|v| v.as_str()).unwrap_or("python");
+            let exec_result = sb.execute_code(lang, code, None);
+            match exec_result {
+                Ok(r) => {
+                    tracing::info!(
+                        "Sandbox [round {}] exit={} stdout={} bytes",
+                        round, r.exit_code, r.stdout.len(),
+                    );
+                    if r.exit_code == 0 && !r.stdout.is_empty() {
+                        sandbox_outputs.push(r.stdout.trim().to_string());
+                    } else if !r.stderr.is_empty() {
+                        sandbox_outputs.push(format!("Error: {}", r.stderr.trim()));
+                    } else {
+                        sandbox_outputs.push("(no output)".to_string());
+                    }
+                }
+                Err(e) => {
+                    sandbox_outputs.push(format!("Error: {}", e));
+                }
+            }
         }
 
-        // Instead of trying to make the model re-generate (which causes
-        // infinite tool-call loops), directly return the sandbox output
-        // as the response content. The sandbox already executed the code
-        // and got the real data — just present it.
-        let sandbox_output = sandbox_results.join("\n");
+        // Return the sandbox stdout directly as the response content.
+        let sandbox_output = sandbox_outputs.join("\n\n");
         let _ = tx.send(InferenceEvent::Token(sandbox_output));
         let _ = tx.send(InferenceEvent::Usage(UsageStats {
             prompt_tokens: total_prompt_tokens,
