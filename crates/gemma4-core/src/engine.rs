@@ -428,7 +428,7 @@ fn process_request_llama_cpp(
     request: &InferenceRequest,
     sandbox: &Option<Sandbox>,
 ) -> Result<()> {
-    let messages: Vec<ChatMessage> = match &request.input {
+    let mut messages: Vec<ChatMessage> = match &request.input {
         InferenceInput::Chat(msgs) => msgs.clone(),
         InferenceInput::Raw(text) => {
             vec![ChatMessage {
@@ -439,6 +439,32 @@ fn process_request_llama_cpp(
             }]
         }
     };
+
+    // Inject sandbox system prompt so the model knows it can execute code
+    if sandbox.is_some() {
+        let has_system = messages.first().map(|m| m.role == "system").unwrap_or(false);
+        let sandbox_prompt = concat!(
+            "You have access to a code execution sandbox. ",
+            "You can write and run code in Python, C, C++, Rust, and Bash. ",
+            "The sandbox has network access and can fetch data from the internet. ",
+            "Python has numpy, pandas, matplotlib, scipy, and requests installed. ",
+            "When the user asks you to do something that requires code execution, ",
+            "write the code in a fenced code block (```python ... ```) so they can run it. ",
+            "When the user asks you to fetch data, write code that does it — you have full internet access."
+        );
+        if has_system {
+            // Append to existing system message
+            messages[0].content = format!("{}\n\n{}", messages[0].content, sandbox_prompt);
+        } else {
+            // Prepend new system message
+            messages.insert(0, ChatMessage {
+                role: "system".to_string(),
+                content: sandbox_prompt.to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+    }
 
     let tools = request.tools.clone();
     let tx = &request.response_tx;
