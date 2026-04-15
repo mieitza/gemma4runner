@@ -152,9 +152,11 @@ fn truncate_code(code: &str) -> String {
 ///   2. Fallback: `NAME\nCODE` or `NAME:suffix\nCODE` (bare code block)
 ///   3. Fallback with literal escapes: `NAME\\nCODE` (model outputs \n as two chars)
 fn parse_single_call(body: &str) -> Option<ParsedToolCall> {
-    // Standard format: NAME{key:val,...}
+    // Standard format: NAME{key:val,...} or NAME:suffix {key:val,...}
     if let Some(brace_pos) = body.find('{') {
-        let name = body[..brace_pos].trim().to_string();
+        let raw_name = body[..brace_pos].trim();
+        // Strip suffixes like ":code_block", ":code" from the name
+        let name = raw_name.split(':').next().unwrap_or(raw_name).trim().to_string();
         let args_str = &body[brace_pos..];
         let json_str = gemma_dsl_to_json(args_str);
         if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&json_str) {
