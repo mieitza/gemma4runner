@@ -190,13 +190,18 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     while let Some(open_pos) = text[search_from..].find(TOOL_CALL_OPEN) {
         let block_start = search_from + open_pos + TOOL_CALL_OPEN.len();
 
-        let close_pos = match text[block_start..].find(TOOL_CALL_CLOSE) {
-            Some(p) => p,
-            None => break, // malformed – no closing tag
+        let (block, next_search) = match text[block_start..].find(TOOL_CALL_CLOSE) {
+            Some(p) => (
+                &text[block_start..block_start + p],
+                block_start + p + TOOL_CALL_CLOSE.len(),
+            ),
+            None => {
+                // No closing tag — treat rest of text as the tool call body.
+                // This handles models that hit EOS without emitting <tool_call|>.
+                (&text[block_start..], text.len())
+            }
         };
-
-        let block = &text[block_start..block_start + close_pos];
-        search_from = block_start + close_pos + TOOL_CALL_CLOSE.len();
+        search_from = next_search;
 
         // The block must start with "call:".
         if !block.starts_with(CALL_PREFIX) {
