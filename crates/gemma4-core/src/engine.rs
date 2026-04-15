@@ -448,9 +448,9 @@ fn process_request_llama_cpp(
             "You can write and run code in Python, C, C++, Rust, and Bash. ",
             "The sandbox has network access and can fetch data from the internet. ",
             "Python has numpy, pandas, matplotlib, scipy, and requests installed. ",
-            "When the user asks you to do something that requires code execution, ",
-            "write the code in a fenced code block (```python ... ```) so they can run it. ",
-            "When the user asks you to fetch data, write code that does it — you have full internet access."
+            "When asked to write or run code, put it in a markdown code block like ```python\\n...\\n```. ",
+            "Do NOT use tool_call syntax. Always write code in markdown fenced code blocks. ",
+            "When asked to fetch data, write Python code using requests that does it."
         );
         if has_system {
             // Append to existing system message

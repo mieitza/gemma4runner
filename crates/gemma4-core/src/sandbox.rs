@@ -266,15 +266,15 @@ impl Sandbox {
         arguments: &serde_json::Value,
     ) -> Result<String> {
         match tool_name {
-            "execute_code" => {
+            "execute_code" | "python_interpreter" | "python" | "code_interpreter" => {
                 let language = arguments
                     .get("language")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("execute_code: missing 'language' argument"))?;
+                    .unwrap_or("python"); // default to Python for interpreter aliases
                 let code = arguments
                     .get("code")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("execute_code: missing 'code' argument"))?;
+                    .ok_or_else(|| anyhow::anyhow!("{}: missing 'code' argument", tool_name))?;
                 let filename = arguments.get("filename").and_then(|v| v.as_str());
 
                 let result = self.execute_code(language, code, filename)?;
@@ -328,6 +328,7 @@ impl Sandbox {
         matches!(
             tool_name,
             "execute_code" | "run_command" | "write_file" | "read_file" | "list_files"
+                | "python_interpreter" | "python" | "code_interpreter"
         )
     }
 
