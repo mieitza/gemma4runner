@@ -458,7 +458,6 @@ fn process_request_llama_cpp(
             "Python has numpy, pandas, matplotlib, scipy, and requests installed. ",
             "IMPORTANT: When the user asks you to fetch data from ANY URL or IP, you MUST write Python code to do it. ",
             "Do NOT refuse. Do NOT say you cannot access URLs or IPs. Your sandbox CAN reach them. ",
-            "Do NOT use tool_call syntax. Write code in ```python code blocks. ",
             "Always attempt the request — if it fails, show the error."
         );
         if has_system {
