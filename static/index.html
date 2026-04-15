@@ -83,14 +83,20 @@ function escapeHtml(s) {
 }
 
 function renderMarkdown(text) {
-  // Code blocks with run button
+  // Extract code blocks first, replace with placeholders to protect from later transforms
+  const codeBlocks = [];
   text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
     const l = lang || 'text';
-    const escaped = escapeHtml(code.trim());
+    const trimmed = code.trim();
+    const escaped = escapeHtml(trimmed);
     const id = 'code-' + Math.random().toString(36).substr(2,6);
     const runnable = ['python','c','cpp','rust','bash','javascript'].includes(l);
     const runBtn = runnable ? `<button class="run-btn" onclick="runCode('${id}','${l}')">Run</button>` : '';
-    return `<pre>${runBtn}<code id="${id}" data-lang="${l}">${escaped}</code></pre>`;
+    // Store raw code as base64 in data attribute to preserve newlines exactly
+    const rawB64 = btoa(unescape(encodeURIComponent(trimmed)));
+    const placeholder = `%%CODEBLOCK_${codeBlocks.length}%%`;
+    codeBlocks.push(`<pre>${runBtn}<code id="${id}" data-lang="${l}" data-code="${rawB64}">${escaped}</code></pre>`);
+    return placeholder;
   });
   // Inline code
   text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
@@ -98,8 +104,12 @@ function renderMarkdown(text) {
   text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   // Italic
   text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  // Line breaks
+  // Line breaks (only outside code blocks)
   text = text.replace(/\n/g, '<br>');
+  // Restore code blocks
+  codeBlocks.forEach((block, i) => {
+    text = text.replace(`%%CODEBLOCK_${i}%%`, block);
+  });
   return text;
 }
 
@@ -172,7 +182,9 @@ async function sendMessage() {
 
 async function runCode(id, lang) {
   const codeEl = document.getElementById(id);
-  const code = codeEl.textContent;
+  // Read raw code from base64 data attribute (preserves newlines)
+  const rawB64 = codeEl.getAttribute('data-code');
+  const code = rawB64 ? decodeURIComponent(escape(atob(rawB64))) : codeEl.textContent;
   const pre = codeEl.closest('pre');
 
   // Remove existing result if any
