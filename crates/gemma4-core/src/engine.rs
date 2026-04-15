@@ -636,12 +636,17 @@ fn process_request_llama_cpp(
                 result.len(),
             );
 
+            // Normalize tool name for the response (strip suffixes/spaces)
+            let clean_name = tc.name.split_whitespace().next().unwrap_or(&tc.name)
+                .split(':').next().unwrap_or(&tc.name);
             continuation.push_str(&format!(
-                "<|turn>tool\n<|tool_response>response:{}{{value:<|\"|>{}<|\"|>}}<tool_response|><turn|>\n",
-                tc.name, result,
+                "<|tool_response>response:{}{{value:<|\"|>{}<|\"|>}}<tool_response|>",
+                clean_name, result,
             ));
         }
-        continuation.push_str("<|turn>model\n");
+        // After tool response, the model continues generating.
+        // Add thinking suppression to prevent the model from thinking again.
+        continuation.push_str("<|channel>thought\n<channel|>");
 
         let cont_token_count = llama
             .tokenize(&continuation, false)
