@@ -152,7 +152,9 @@ pub async fn chat_completions(
                 index: 0,
                 message: ChoiceMessage {
                     role: "assistant".into(),
-                    content: Some(result.content),
+                    // Strip any raw tool call tokens that leaked into the content
+                    // (happens when sandbox auto-executes tool calls)
+                    content: Some(gemma4_core::tool_parser::strip_tool_calls(&result.content)),
                     thinking: result.thinking,
                     tool_calls: api_tool_calls,
                 },

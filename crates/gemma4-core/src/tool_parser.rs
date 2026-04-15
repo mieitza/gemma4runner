@@ -265,6 +265,26 @@ pub fn content_before_tool_calls(text: &str) -> Option<String> {
     }
 }
 
+/// Strip all tool call blocks from text, keeping only non-tool-call content.
+/// Handles both closed (`<|tool_call>...<tool_call|>`) and unclosed blocks.
+pub fn strip_tool_calls(text: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
+    while let Some(open_pos) = remaining.find(TOOL_CALL_OPEN) {
+        result.push_str(&remaining[..open_pos]);
+        let after_open = &remaining[open_pos + TOOL_CALL_OPEN.len()..];
+        if let Some(close_pos) = after_open.find(TOOL_CALL_CLOSE) {
+            remaining = &after_open[close_pos + TOOL_CALL_CLOSE.len()..];
+        } else {
+            // Unclosed — strip everything to end
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result.trim().to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
