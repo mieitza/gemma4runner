@@ -19,7 +19,8 @@ pub struct SamplingParams {
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
-            temperature: 1.0, top_p: 1.0, top_k: None, max_tokens: 2048,
+            // Google's recommended defaults for Gemma 4
+            temperature: 1.0, top_p: 0.95, top_k: Some(64), max_tokens: 2048,
             seed: None, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
         }
     }
@@ -176,7 +177,7 @@ mod tests {
     fn test_default_params() {
         let params = SamplingParams::default();
         assert_eq!(params.temperature, 1.0);
-        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.top_p, 0.95);
         assert_eq!(params.max_tokens, 2048);
         assert_eq!(params.repetition_penalty, 1.0);
     }

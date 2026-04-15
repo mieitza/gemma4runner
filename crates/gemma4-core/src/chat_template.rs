@@ -119,6 +119,21 @@ fn json_args_to_gemma_dsl(arguments: &str) -> String {
     }
 }
 
+/// Strip thinking content from assistant messages.
+/// Matches the official template's `strip_thinking` macro:
+/// removes `<|channel>...<channel|>` blocks.
+fn strip_thinking(text: &str) -> String {
+    let mut result = String::new();
+    for part in text.split("<channel|>") {
+        if let Some(pos) = part.find("<|channel>") {
+            result.push_str(&part[..pos]);
+        } else {
+            result.push_str(part);
+        }
+    }
+    result.trim().to_string()
+}
+
 pub fn format_chat_prompt(messages: &[ChatMessage]) -> String {
     format_chat_prompt_with_options(messages, &ChatFormatOptions::default())
 }
@@ -187,7 +202,10 @@ pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatF
                     }
                     prompt.push_str(&format!("<|turn>model\n{}<turn|>\n", turn_content));
                 } else {
-                    prompt.push_str(&format!("<|turn>model\n{}<turn|>\n", msg.content));
+                    // Strip thinking from previous assistant messages in multi-turn.
+                    // Official docs: "Do NOT include thinking content from previous turns."
+                    let content = strip_thinking(&msg.content);
+                    prompt.push_str(&format!("<|turn>model\n{}<turn|>\n", content));
                 }
             }
             "system" | "developer" => {
