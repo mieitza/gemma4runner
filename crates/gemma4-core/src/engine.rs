@@ -478,6 +478,23 @@ fn process_request_llama_cpp(
     let mut total_prompt_tokens = 0usize;
     let mut total_completion_tokens = 0usize;
 
+    // When a sandbox is available, the model may emit tool calls that we
+    // auto-execute and feed back.  In that scenario we must NOT stream the
+    // intermediate tool-call tokens to the client -- they would show up as
+    // garbage and then get stripped, leaving the response empty.
+    //
+    // Strategy:
+    //   1. Buffer ALL tokens during generation (never send Token events).
+    //   2. After each generation round, check for tool calls.
+    //   3. If sandbox tool calls are found, execute them, build continuation
+    //      text, and continue generation -- still buffering.
+    //   4. After the tool-call loop ends, send the final clean content
+    //      (with any remaining tool-call markup stripped) as Token events.
+    //
+    // When there is no sandbox, tokens are streamed as before for low
+    // latency on the normal (no auto-execution) path.
+    let has_sandbox = sandbox.is_some();
+
     // Maximum rounds of tool-call execution to prevent infinite loops
     const MAX_TOOL_ROUNDS: usize = 10;
 
@@ -494,39 +511,61 @@ fn process_request_llama_cpp(
     let mut all_text = String::new();
     let mut completion_tokens = 0usize;
 
+    // Accumulate content/thinking across all rounds when buffering.
+    // These are only used when has_sandbox is true; in the non-sandbox
+    // path tokens are sent directly via the channel.
+    let mut buffered_thinking = String::new();
+    // Track whether any sandbox tool calls were actually executed so we
+    // know whether to strip tool-call markup from the final output.
+    let mut sandbox_executed = false;
+
     let (generated, mut gen_state) = llama.generate_streaming_with_state(
         &prompt,
         &request.sampling,
         |_token, text| {
             completion_tokens += 1;
             all_text.push_str(text);
-            for event in think_parser.feed(text) {
-                match event {
-                    crate::think_parser::ThinkEvent::Content(s) => {
-                        let _ = tx.send(InferenceEvent::Token(s));
+            if !has_sandbox {
+                // No sandbox -- stream tokens directly for low latency.
+                for event in think_parser.feed(text) {
+                    match event {
+                        crate::think_parser::ThinkEvent::Content(s) => {
+                            let _ = tx.send(InferenceEvent::Token(s));
+                        }
+                        crate::think_parser::ThinkEvent::Thinking(s) => {
+                            let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                        }
                     }
-                    crate::think_parser::ThinkEvent::Thinking(s) => {
-                        let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                }
+            } else {
+                // Sandbox present -- buffer; process think tags to separate
+                // thinking from content but don't send anything yet.
+                for event in think_parser.feed(text) {
+                    if let crate::think_parser::ThinkEvent::Thinking(s) = event {
+                        buffered_thinking.push_str(&s);
                     }
+                    // Content events: we reconstruct clean content from
+                    // all_text at the end, so no need to accumulate here.
                 }
             }
             true
         },
     )?;
-    // Account for the generated tokens in the KV-cache position counter.
-    // generate_streaming_with_state already tracks n_decoded correctly for
-    // prompt + decoded tokens, but it does not count the *sampled* tokens
-    // that were fed back one-by-one.  n_decoded is already correct.
     let _ = generated; // consumed
 
+    // Flush think parser for round 1.
     for event in think_parser.flush() {
-        match event {
-            crate::think_parser::ThinkEvent::Content(s) => {
-                let _ = tx.send(InferenceEvent::Token(s));
+        if !has_sandbox {
+            match event {
+                crate::think_parser::ThinkEvent::Content(s) => {
+                    let _ = tx.send(InferenceEvent::Token(s));
+                }
+                crate::think_parser::ThinkEvent::Thinking(s) => {
+                    let _ = tx.send(InferenceEvent::ThinkingToken(s));
+                }
             }
-            crate::think_parser::ThinkEvent::Thinking(s) => {
-                let _ = tx.send(InferenceEvent::ThinkingToken(s));
-            }
+        } else if let crate::think_parser::ThinkEvent::Thinking(s) = event {
+            buffered_thinking.push_str(&s);
         }
     }
     total_completion_tokens += completion_tokens;
@@ -545,6 +584,18 @@ fn process_request_llama_cpp(
         if !has_sandbox_calls || sandbox.is_none() {
             // Non-sandbox tool calls: report to caller and finish.
             if !parsed.is_empty() {
+                // Send any content that preceded the tool calls.
+                if has_sandbox {
+                    let pre = crate::tool_parser::strip_tool_calls(&all_text);
+                    if !pre.is_empty() {
+                        let _ = tx.send(InferenceEvent::Token(pre));
+                    }
+                    if !buffered_thinking.is_empty() {
+                        let _ = tx.send(InferenceEvent::ThinkingToken(
+                            std::mem::take(&mut buffered_thinking),
+                        ));
+                    }
+                }
                 let _ = tx.send(InferenceEvent::ToolCalls(parsed));
                 let _ = tx.send(InferenceEvent::Usage(UsageStats {
                     prompt_tokens: total_prompt_tokens,
@@ -557,6 +608,7 @@ fn process_request_llama_cpp(
         }
 
         // --- Execute sandbox tool calls and build continuation text ---
+        sandbox_executed = true;
         let sb = sandbox.as_ref().unwrap();
 
         // Build the continuation text that will be injected into the
@@ -597,7 +649,8 @@ fn process_request_llama_cpp(
         total_prompt_tokens += cont_token_count;
 
         // Continue generation by feeding the tool-response tokens into
-        // the existing context.
+        // the existing context.  We always buffer here since we are in
+        // the sandbox auto-execution path.
         let mut think_parser =
             crate::think_parser::ThinkParser::new(request.include_thinking);
         all_text.clear();
@@ -610,14 +663,10 @@ fn process_request_llama_cpp(
             |_token, text| {
                 completion_tokens += 1;
                 all_text.push_str(text);
+                // Always buffer during sandbox continuation rounds.
                 for event in think_parser.feed(text) {
-                    match event {
-                        crate::think_parser::ThinkEvent::Content(s) => {
-                            let _ = tx.send(InferenceEvent::Token(s));
-                        }
-                        crate::think_parser::ThinkEvent::Thinking(s) => {
-                            let _ = tx.send(InferenceEvent::ThinkingToken(s));
-                        }
+                    if let crate::think_parser::ThinkEvent::Thinking(s) = event {
+                        buffered_thinking.push_str(&s);
                     }
                 }
                 true
@@ -627,13 +676,8 @@ fn process_request_llama_cpp(
         let _ = new_generated;
 
         for event in think_parser.flush() {
-            match event {
-                crate::think_parser::ThinkEvent::Content(s) => {
-                    let _ = tx.send(InferenceEvent::Token(s));
-                }
-                crate::think_parser::ThinkEvent::Thinking(s) => {
-                    let _ = tx.send(InferenceEvent::ThinkingToken(s));
-                }
+            if let crate::think_parser::ThinkEvent::Thinking(s) = event {
+                buffered_thinking.push_str(&s);
             }
         }
         total_completion_tokens += completion_tokens;
@@ -644,6 +688,17 @@ fn process_request_llama_cpp(
     if crate::tool_parser::has_tool_calls(&all_text) {
         let parsed = crate::tool_parser::parse_tool_calls(&all_text);
         if !parsed.is_empty() {
+            if has_sandbox {
+                let pre = crate::tool_parser::strip_tool_calls(&all_text);
+                if !pre.is_empty() {
+                    let _ = tx.send(InferenceEvent::Token(pre));
+                }
+                if !buffered_thinking.is_empty() {
+                    let _ = tx.send(InferenceEvent::ThinkingToken(
+                        std::mem::take(&mut buffered_thinking),
+                    ));
+                }
+            }
             let _ = tx.send(InferenceEvent::ToolCalls(parsed));
             let _ = tx.send(InferenceEvent::Usage(UsageStats {
                 prompt_tokens: total_prompt_tokens,
@@ -653,6 +708,32 @@ fn process_request_llama_cpp(
             return Ok(());
         }
     }
+
+    // --- Emit the final response ---
+    //
+    // If sandbox tool calls were auto-executed, the buffered all_text
+    // now contains only the model's FINAL answer (after seeing tool
+    // results).  Strip any residual tool-call markup and send it.
+    if has_sandbox && sandbox_executed {
+        let clean = crate::tool_parser::strip_tool_calls(&all_text);
+        if !clean.is_empty() {
+            let _ = tx.send(InferenceEvent::Token(clean));
+        }
+        if !buffered_thinking.is_empty() {
+            let _ = tx.send(InferenceEvent::ThinkingToken(buffered_thinking));
+        }
+    } else if has_sandbox {
+        // Sandbox was available but no tool calls were made -- send the
+        // buffered content now.  Strip tool-call markup just in case.
+        let clean = crate::tool_parser::strip_tool_calls(&all_text);
+        if !clean.is_empty() {
+            let _ = tx.send(InferenceEvent::Token(clean));
+        }
+        if !buffered_thinking.is_empty() {
+            let _ = tx.send(InferenceEvent::ThinkingToken(buffered_thinking));
+        }
+    }
+    // else: no sandbox -- tokens were already streamed in real time.
 
     let finish_reason = if completion_tokens < request.sampling.max_tokens {
         FinishReason::Stop
