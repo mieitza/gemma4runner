@@ -100,31 +100,64 @@ fn gemma_dsl_to_json(dsl: &str) -> String {
     out
 }
 
+/// Unescape literal `\n`, `\"`, `\\`, `\t` in a string.
+/// The model often outputs these as two-character sequences instead of real control chars.
+fn unescape_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('n') => { chars.next(); out.push('\n'); }
+                Some('t') => { chars.next(); out.push('\t'); }
+                Some('"') => { chars.next(); out.push('"'); }
+                Some('\\') => { chars.next(); out.push('\\'); }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse a single tool call body (the text after "call:").
 ///
 /// Handles two formats:
 ///   1. Standard: `NAME{key:val,...}` (Gemma DSL brace format)
 ///   2. Fallback: `NAME\nCODE` or `NAME:suffix\nCODE` (bare code block)
+///   3. Fallback with literal escapes: `NAME\\nCODE` (model outputs \n as two chars)
 fn parse_single_call(body: &str) -> Option<ParsedToolCall> {
     // Standard format: NAME{key:val,...}
     if let Some(brace_pos) = body.find('{') {
         let name = body[..brace_pos].trim().to_string();
         let args_str = &body[brace_pos..];
         let json_str = gemma_dsl_to_json(args_str);
-        if let Ok(arguments) = serde_json::from_str(&json_str) {
+        if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&json_str) {
             if !name.is_empty() {
+                // If arguments contain a "code" field with escaped newlines, unescape it
+                let arguments = if let Some(code) = arguments.get("code").and_then(|v| v.as_str()) {
+                    let unescaped = unescape_literals(code);
+                    let mut map = arguments.as_object().cloned().unwrap_or_default();
+                    map.insert("code".to_string(), serde_json::Value::String(unescaped));
+                    serde_json::Value::Object(map)
+                } else {
+                    arguments
+                };
                 return Some(ParsedToolCall { name, arguments });
             }
         }
     }
 
+    // Unescape the entire body — model outputs literal \n instead of newlines
+    let unescaped = unescape_literals(body);
+    let body_ref = if unescaped.contains('\n') { &unescaped } else { body };
+
     // Fallback: NAME\nCODE or NAME:CODE_BLOCK_TYPE\nCODE
-    // Handle "python\ncode..." or "python:code_block\ncode..."
-    let (name, code) = if let Some(newline_pos) = body.find('\n') {
-        let raw_name = body[..newline_pos].trim_end_matches(|c: char| c == ':' || c == ' ');
-        // Strip any suffix like ":code_block" from the name
+    let (name, code) = if let Some(newline_pos) = body_ref.find('\n') {
+        let raw_name = body_ref[..newline_pos].trim_end_matches(|c: char| c == ':' || c == ' ');
         let clean_name = raw_name.split(':').next().unwrap_or(raw_name).trim();
-        let code = &body[newline_pos + 1..];
+        let code = &body_ref[newline_pos + 1..];
         (clean_name.to_string(), code.to_string())
     } else {
         return None;
@@ -273,11 +306,31 @@ mod tests {
 
     #[test]
     fn test_gemma_dsl_to_json_mixed() {
-        // key:value where value is a string token
         let dsl = r#"{name:<|"|>Alice<|"|>,age:30}"#;
         let json = gemma_dsl_to_json(dsl);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["name"], "Alice");
         assert_eq!(v["age"], 30);
+    }
+
+    #[test]
+    fn test_parse_literal_backslash_n() {
+        // Model outputs literal \n instead of real newlines
+        let text = r#"<|tool_call>call:python\nimport requests\nprint("hello")<tool_call|>"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should parse tool call with literal \\n");
+        assert_eq!(calls[0].name, "python_interpreter");
+        let code = calls[0].arguments["code"].as_str().unwrap();
+        assert!(code.contains('\n'), "code should have real newlines after unescaping");
+        assert!(code.contains("import requests"));
+        assert!(code.contains("print(\"hello\")"));
+    }
+
+    #[test]
+    fn test_unescape_literals() {
+        assert_eq!(unescape_literals(r#"hello\nworld"#), "hello\nworld");
+        assert_eq!(unescape_literals(r#"a\tb"#), "a\tb");
+        assert_eq!(unescape_literals(r#"say \"hi\""#), "say \"hi\"");
+        assert_eq!(unescape_literals(r#"no escapes"#), "no escapes");
     }
 }
