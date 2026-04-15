@@ -608,17 +608,11 @@ fn process_request_llama_cpp(
             break;
         }
 
-        // --- Execute sandbox tool calls and build continuation text ---
+        // --- Execute sandbox tool calls and return result directly ---
         sandbox_executed = true;
         let sb = sandbox.as_ref().unwrap();
 
-        // Build the continuation text that will be injected into the
-        // existing KV cache.  Format:
-        //   <turn|>\n                          (close assistant turn)
-        //   <|turn>tool\n<|tool_response>response:NAME{value:<|"|>RESULT<|"|>}<tool_response|><turn|>\n
-        //   ...
-        //   <|turn>model\n                     (begin new model turn)
-        let mut continuation = String::from("<turn|>\n");
+        let mut sandbox_results = Vec::new();
         for tc in parsed.iter() {
             if !Sandbox::is_sandbox_tool(&tc.name) {
                 continue;
@@ -627,32 +621,33 @@ fn process_request_llama_cpp(
                 Ok(r) => r,
                 Err(e) => format!("Error: {}", e),
             };
-
             tracing::info!(
                 "Sandbox tool [round {}] {}({}) => {} bytes",
-                round,
-                tc.name,
-                tc.arguments,
-                result.len(),
+                round, tc.name, tc.arguments, result.len(),
             );
-
-            // Normalize tool name for the response (strip suffixes/spaces)
-            let clean_name = tc.name.split_whitespace().next().unwrap_or(&tc.name)
-                .split(':').next().unwrap_or(&tc.name);
-            continuation.push_str(&format!(
-                "<|tool_response>response:{}{{value:<|\"|>{}<|\"|>}}<tool_response|>",
-                clean_name, result,
-            ));
+            sandbox_results.push(result);
         }
-        // After tool response, the model continues generating.
-        // Add thinking suppression to prevent the model from thinking again.
-        continuation.push_str("<|channel>thought\n<channel|>");
 
-        let cont_token_count = llama
-            .tokenize(&continuation, false)
-            .map(|t| t.len())
-            .unwrap_or(0);
+        // Instead of trying to make the model re-generate (which causes
+        // infinite tool-call loops), directly return the sandbox output
+        // as the response content. The sandbox already executed the code
+        // and got the real data — just present it.
+        let sandbox_output = sandbox_results.join("\n");
+        let _ = tx.send(InferenceEvent::Token(sandbox_output));
+        let _ = tx.send(InferenceEvent::Usage(UsageStats {
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+        }));
+        let _ = tx.send(InferenceEvent::Done(FinishReason::Stop));
+        return Ok(());
+
+        // NOTE: The code below (continue_generation) is kept but unreachable.
+        // The model loops when we feed tool responses back. Direct sandbox
+        // output is the reliable path until the continuation format is fixed.
+        #[allow(unreachable_code)]
+        let cont_token_count = 0usize;
         total_prompt_tokens += cont_token_count;
+        let continuation = String::new();
 
         // Continue generation by feeding the tool-response tokens into
         // the existing context.  We always buffer here since we are in
