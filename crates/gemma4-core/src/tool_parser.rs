@@ -124,6 +124,16 @@ fn unescape_literals(s: &str) -> String {
 /// Truncate code at the first non-code marker.
 /// The model often generates code then continues with fabricated output/explanation.
 fn truncate_code(code: &str) -> String {
+    // Strip trailing DSL artifacts: "} or }\n or "\n} etc.
+    let code = code.trim_end();
+    let code = if code.ends_with("\"}") {
+        &code[..code.len()-2]
+    } else if code.ends_with("}") {
+        &code[..code.len()-1]
+    } else {
+        code
+    };
+    let code = code.trim_end_matches('"').trim_end();
     // Cut at first triple-backtick (model closes its own code block)
     let code = if let Some(pos) = code.find("```") {
         &code[..pos]
