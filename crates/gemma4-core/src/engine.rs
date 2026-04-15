@@ -128,8 +128,15 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     pub fn send(&self, request: InferenceRequest) -> Result<()> {
-        self.request_tx.try_send(request)
-            .map_err(|e| anyhow::anyhow!("Engine queue full or disconnected: {}", e))
+        match self.request_tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                anyhow::bail!("queue_full")
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                anyhow::bail!("engine_dead: inference thread has stopped")
+            }
+        }
     }
 }
 

@@ -100,6 +100,52 @@ fn gemma_dsl_to_json(dsl: &str) -> String {
     out
 }
 
+/// Parse a single tool call body (the text after "call:").
+///
+/// Handles two formats:
+///   1. Standard: `NAME{key:val,...}` (Gemma DSL brace format)
+///   2. Fallback: `NAME\nCODE` or `NAME:suffix\nCODE` (bare code block)
+fn parse_single_call(body: &str) -> Option<ParsedToolCall> {
+    // Standard format: NAME{key:val,...}
+    if let Some(brace_pos) = body.find('{') {
+        let name = body[..brace_pos].trim().to_string();
+        let args_str = &body[brace_pos..];
+        let json_str = gemma_dsl_to_json(args_str);
+        if let Ok(arguments) = serde_json::from_str(&json_str) {
+            if !name.is_empty() {
+                return Some(ParsedToolCall { name, arguments });
+            }
+        }
+    }
+
+    // Fallback: NAME\nCODE or NAME:CODE_BLOCK_TYPE\nCODE
+    // Handle "python\ncode..." or "python:code_block\ncode..."
+    let (name, code) = if let Some(newline_pos) = body.find('\n') {
+        let raw_name = body[..newline_pos].trim_end_matches(|c: char| c == ':' || c == ' ');
+        // Strip any suffix like ":code_block" from the name
+        let clean_name = raw_name.split(':').next().unwrap_or(raw_name).trim();
+        let code = &body[newline_pos + 1..];
+        (clean_name.to_string(), code.to_string())
+    } else {
+        return None;
+    };
+
+    if code.is_empty() {
+        return None;
+    }
+
+    // Map common tool names to our sandbox names
+    let mapped_name = match name.as_str() {
+        "python" | "python_interpreter" | "code_interpreter" => "python_interpreter",
+        other => other,
+    };
+
+    Some(ParsedToolCall {
+        name: mapped_name.to_string(),
+        arguments: serde_json::json!({"code": code, "language": "python"}),
+    })
+}
+
 /// Parse all tool calls from model output text.
 ///
 /// Gemma 4 emits tool calls as:
@@ -125,29 +171,9 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
         }
         let rest = &block[CALL_PREFIX.len()..];
 
-        // Split function name from the argument object.
-        let (name, args_dsl) = match rest.find('{') {
-            Some(brace) => {
-                let name = rest[..brace].trim().to_string();
-                let args = &rest[brace..];
-                (name, args)
-            }
-            None => {
-                // No arguments block at all – treat as empty object.
-                (rest.trim().to_string(), "{}")
-            }
-        };
-
-        if name.is_empty() {
-            continue;
+        if let Some(call) = parse_single_call(rest) {
+            calls.push(call);
         }
-
-        let json_str = gemma_dsl_to_json(args_dsl);
-        let arguments: Value = serde_json::from_str(&json_str).unwrap_or(Value::Object(
-            serde_json::Map::new(),
-        ));
-
-        calls.push(ParsedToolCall { name, arguments });
     }
 
     calls

@@ -48,6 +48,7 @@ pub fn resolve_model_source(source: &str, hf_token: Option<&str>) -> Result<Path
 }
 
 fn download_from_hub(model_id: &str, token: Option<&str>) -> Result<PathBuf> {
+    tracing::info!("Downloading from HuggingFace Hub (no timeout - this may take a while for large models)...");
     let mut builder = hf_hub::api::sync::ApiBuilder::new();
     if let Some(token) = token {
         builder = builder.with_token(Some(token.to_string()));
@@ -87,6 +88,7 @@ pub fn is_gguf_file(path: &Path) -> bool {
 /// Download just the tokenizer.json from a HuggingFace model.
 /// Used when loading GGUF files that don't include a separate tokenizer.
 pub fn download_tokenizer(model_id: &str, token: Option<&str>) -> Result<PathBuf> {
+    tracing::info!("Downloading from HuggingFace Hub (no timeout - this may take a while for large models)...");
     let mut builder = hf_hub::api::sync::ApiBuilder::new();
     if let Some(token) = token {
         builder = builder.with_token(Some(token.to_string()));

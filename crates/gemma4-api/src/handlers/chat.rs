@@ -42,6 +42,32 @@ pub async fn chat_completions(
         tool_call_id: m.tool_call_id.clone(),
     }).collect();
 
+    // Validate sampling parameters
+    if let Some(temp) = request.temperature {
+        if temp < 0.0 || temp > 2.0 {
+            return Err(ApiError::bad_request(
+                "temperature must be between 0 and 2",
+                Some("temperature".into()),
+            ));
+        }
+    }
+    if let Some(top_p) = request.top_p {
+        if top_p < 0.0 || top_p > 1.0 {
+            return Err(ApiError::bad_request(
+                "top_p must be between 0 and 1",
+                Some("top_p".into()),
+            ));
+        }
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        if max_tokens == 0 {
+            return Err(ApiError::bad_request(
+                "max_tokens must be greater than 0",
+                Some("max_tokens".into()),
+            ));
+        }
+    }
+
     let sampling = SamplingParams {
         temperature: request.temperature.unwrap_or(1.0),
         top_p: request.top_p.unwrap_or(1.0),
@@ -76,7 +102,14 @@ pub async fn chat_completions(
         tools,
         include_thinking,
     };
-    engine.send(inference_request).map_err(|_| ApiError::too_many_requests("Server is busy. Please retry later."))?;
+    engine.send(inference_request).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("engine_dead") {
+            ApiError::service_unavailable("Inference engine has crashed. Restart the server.")
+        } else {
+            ApiError::too_many_requests("Server is busy. Please retry later.")
+        }
+    })?;
 
     if request.stream.unwrap_or(false) {
         let stream = inference_event_stream(response_rx, request_id, model_name);
