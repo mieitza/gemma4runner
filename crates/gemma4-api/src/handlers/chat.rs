@@ -156,8 +156,12 @@ pub async fn chat_completions(
                     // (happens when sandbox auto-executes tool calls)
                     content: {
                         let mut c = gemma4_core::tool_parser::strip_tool_calls(&result.content);
-                        // Strip thinking suppression tokens that leak into content
-                        c = c.replace("<|channel>thought\n<channel|>", "").trim().to_string();
+                        // Strip all thinking/channel control tokens that leak into content
+                        c = c.replace("<|channel>thought\n<channel|>", "");
+                        c = c.replace("<|channel>thought", "");
+                        c = c.replace("<channel|>", "");
+                        c = c.replace("<|think|>", "");
+                        c = c.trim().to_string();
                         Some(c)
                     },
                     thinking: result.thinking,
