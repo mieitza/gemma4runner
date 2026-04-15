@@ -42,21 +42,40 @@ pub fn format_tool_definition(
     description: Option<&str>,
     parameters: Option<&serde_json::Value>,
 ) -> String {
-    let mut obj = String::from("{");
-    let mut first = true;
+    // Official format: declaration:NAME{description:<|"|>DESC<|"|>,parameters:{...},type:<|"|>OBJECT<|"|>}
+    // Keys are UNQUOTED in declarations (no <|"|> around key names)
+    let mut parts = Vec::new();
 
     if let Some(desc) = description {
-        obj.push_str(&format!("<|\"|>description<|\"|>:<|\"|>{}<|\"|>", desc));
-        first = false;
+        parts.push(format!("description:<|\"|>{}<|\"|>", desc));
     }
 
     if let Some(params) = parameters {
-        if !first { obj.push(','); }
-        obj.push_str(&format!("<|\"|>parameters<|\"|>:{}", format_value_gemma(params)));
+        parts.push(format!("parameters:{}", format_params_gemma(params)));
     }
 
-    obj.push('}');
-    format!("<|tool>declaration:{}{}<tool|>", name, obj)
+    format!("<|tool>declaration:{}{{{}}}<tool|>", name, parts.join(","))
+}
+
+/// Format parameters for tool declarations with unquoted keys.
+/// Matches the official template's `format_parameters` macro.
+fn format_params_gemma(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, format_params_gemma(v)))
+                .collect();
+            format!("{{{}}}", pairs.join(","))
+        }
+        serde_json::Value::String(s) => format!("<|\"|>{}<|\"|>", s),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_params_gemma).collect();
+            format!("[{}]", items.join(","))
+        }
+        serde_json::Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        other => other.to_string(),
+    }
 }
 
 /// Recursively replace JSON double-quote characters with `<|"|>`.
@@ -117,8 +136,15 @@ pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatF
     if !options.tools.is_empty() || options.enable_thinking || first_is_system {
         let mut system_content = String::new();
 
+        // Order matches official template: 1) think 2) system content 3) tools
         if options.enable_thinking {
             system_content.push_str("<|think|>\n");
+        }
+
+        if first_is_system {
+            if let Some(first_msg) = messages.first() {
+                system_content.push_str(first_msg.content.trim());
+            }
         }
 
         for tool in &options.tools {
@@ -128,17 +154,6 @@ pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatF
                 tool.parameters.as_ref(),
             );
             system_content.push_str(&def);
-            system_content.push('\n');
-        }
-
-        // If the first message is a system/developer message, include its content.
-        if first_is_system {
-            if let Some(first_msg) = messages.first() {
-                if !system_content.is_empty() {
-                    system_content.push('\n');
-                }
-                system_content.push_str(&first_msg.content);
-            }
         }
 
         prompt.push_str(&format!("<|turn>system\n{}<turn|>\n", system_content.trim_end()));
