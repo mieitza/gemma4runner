@@ -164,11 +164,13 @@ fn parse_single_call(body: &str) -> Option<ParsedToolCall> {
                 // If arguments contain a "code" field with escaped newlines, unescape it
                 let arguments = if let Some(code) = arguments.get("code").and_then(|v| v.as_str()) {
                     let mut unescaped = unescape_literals(code);
-                    // Strip trailing DSL artifacts: "} or "}  that leak from the Gemma tool call format
-                    unescaped = unescaped.trim_end().to_string();
-                    while unescaped.ends_with("\"}") || unescaped.ends_with("\"}")  {
-                        unescaped = unescaped[..unescaped.len()-2].trim_end().to_string();
-                    }
+                    // Strip trailing DSL artifacts that leak from the Gemma tool call format.
+                    // The model's code ends with something like: print(result)"}
+                    // where "} is the closing of the DSL {code: "..."}
+                    unescaped = unescaped.trim_end_matches('}')
+                        .trim_end_matches('"')
+                        .trim_end()
+                        .to_string();
                     let unescaped = truncate_code(&unescaped);
                     let mut map = arguments.as_object().cloned().unwrap_or_default();
                     map.insert("code".to_string(), serde_json::Value::String(unescaped));
