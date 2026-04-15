@@ -213,7 +213,33 @@ impl Sandbox {
         };
 
         let fname = filename.unwrap_or(default_name);
-        self.write_file(fname, code)?;
+
+        // Auto-prepend missing imports for Python
+        let code = if language == "python" {
+            let mut patched = String::new();
+            if code.contains("requests.") && !code.contains("import requests") {
+                patched.push_str("import requests\n");
+            }
+            if code.contains("json.") && !code.contains("import json") {
+                patched.push_str("import json\n");
+            }
+            if code.contains("np.") && !code.contains("import numpy") {
+                patched.push_str("import numpy as np\n");
+            }
+            if code.contains("pd.") && !code.contains("import pandas") {
+                patched.push_str("import pandas as pd\n");
+            }
+            if !patched.is_empty() {
+                patched.push('\n');
+                patched.push_str(code);
+                patched
+            } else {
+                code.to_string()
+            }
+        } else {
+            code.to_string()
+        };
+        self.write_file(fname, &code)?;
 
         let timeout_secs = self.timeout_secs();
 
