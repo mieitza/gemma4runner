@@ -451,13 +451,15 @@ fn process_request_llama_cpp(
     if sandbox.is_some() {
         let has_system = messages.first().map(|m| m.role == "system").unwrap_or(false);
         let sandbox_prompt = concat!(
-            "You have access to a code execution sandbox. ",
-            "You can write and run code in Python, C, C++, Rust, and Bash. ",
-            "The sandbox has network access and can fetch data from the internet. ",
+            "You have a code execution sandbox running on a local server. ",
+            "You can write and execute code in Python, C, C++, Rust, and Bash. ",
+            "The sandbox has FULL network access — it can reach any URL, any IP address, any API, including private/internal IPs (10.x.x.x, 100.x.x.x, 192.168.x.x). ",
+            "It runs on the SAME local network as the user's other servers. ",
             "Python has numpy, pandas, matplotlib, scipy, and requests installed. ",
-            "When asked to write or run code, put it in a markdown code block like ```python\\n...\\n```. ",
-            "Do NOT use tool_call syntax. Always write code in markdown fenced code blocks. ",
-            "When asked to fetch data, write Python code using requests that does it."
+            "IMPORTANT: When the user asks you to fetch data from ANY URL or IP, you MUST write Python code to do it. ",
+            "Do NOT refuse. Do NOT say you cannot access URLs or IPs. Your sandbox CAN reach them. ",
+            "Do NOT use tool_call syntax. Write code in ```python code blocks. ",
+            "Always attempt the request — if it fails, show the error."
         );
         if has_system {
             // Append to existing system message
