@@ -555,11 +555,11 @@ fn process_request_llama_cpp(
         // Build the continuation text that will be injected into the
         // existing KV cache.  Format:
         //   <turn|>\n                          (close assistant turn)
-        //   <|turn>tool\n<|tool_response>id:call_0\nRESULT<tool_response|><turn|>\n
+        //   <|turn>tool\n<|tool_response>response:NAME{value:<|"|>RESULT<|"|>}<tool_response|><turn|>\n
         //   ...
         //   <|turn>model\n                     (begin new model turn)
         let mut continuation = String::from("<turn|>\n");
-        for (i, tc) in parsed.iter().enumerate() {
+        for tc in parsed.iter() {
             if !Sandbox::is_sandbox_tool(&tc.name) {
                 continue;
             }
@@ -577,8 +577,8 @@ fn process_request_llama_cpp(
             );
 
             continuation.push_str(&format!(
-                "<|turn>tool\n<|tool_response>id:call_{}\n{}<tool_response|><turn|>\n",
-                i, result,
+                "<|turn>tool\n<|tool_response>response:{}{{value:<|\"|>{}<|\"|>}}<tool_response|><turn|>\n",
+                tc.name, result,
             ));
         }
         continuation.push_str("<|turn>model\n");

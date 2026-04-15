@@ -13,6 +13,7 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallInfo {
     pub name: String,
+    /// JSON-encoded arguments string (e.g. `{"city":"Bangkok"}`).
     pub arguments: String,
 }
 
@@ -77,6 +78,28 @@ pub fn format_value_gemma(value: &serde_json::Value) -> String {
     }
 }
 
+/// Convert a JSON arguments string to Gemma DSL call format.
+///
+/// Input:  `{"city":"Bangkok","units":"metric"}`
+/// Output: `city:<|"|>Bangkok<|"|>,units:<|"|>metric<|"|>`
+///
+/// The caller wraps this in `call:NAME{...}`.
+fn json_args_to_gemma_dsl(arguments: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(arguments)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    match &value {
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, format_value_gemma(v)))
+                .collect();
+            pairs.join(",")
+        }
+        _ => String::new(),
+    }
+}
+
 pub fn format_chat_prompt(messages: &[ChatMessage]) -> String {
     format_chat_prompt_with_options(messages, &ChatFormatOptions::default())
 }
@@ -84,8 +107,14 @@ pub fn format_chat_prompt(messages: &[ChatMessage]) -> String {
 pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatFormatOptions) -> String {
     let mut prompt = String::from("<bos>");
 
-    // Emit system preamble turn if tools or thinking are enabled
-    if !options.tools.is_empty() || options.enable_thinking {
+    // Determine if the first message is a system/developer message.
+    let first_is_system = messages
+        .first()
+        .map(|m| m.role == "system" || m.role == "developer")
+        .unwrap_or(false);
+
+    // Emit system preamble turn if: thinking enabled, tools present, OR first message is system/developer.
+    if !options.tools.is_empty() || options.enable_thinking || first_is_system {
         let mut system_content = String::new();
 
         if options.enable_thinking {
@@ -102,27 +131,43 @@ pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatF
             system_content.push('\n');
         }
 
+        // If the first message is a system/developer message, include its content.
+        if first_is_system {
+            if let Some(first_msg) = messages.first() {
+                if !system_content.is_empty() {
+                    system_content.push('\n');
+                }
+                system_content.push_str(&first_msg.content);
+            }
+        }
+
         prompt.push_str(&format!("<|turn>system\n{}<turn|>\n", system_content.trim_end()));
     }
 
-    for msg in messages {
+    // Determine the starting index: skip the first message if it was a system/developer message
+    // already included in the system preamble.
+    let msg_iter_start = if first_is_system { 1 } else { 0 };
+
+    for msg in &messages[msg_iter_start..] {
         match msg.role.as_str() {
             "tool" => {
-                // Tool response message
-                let tool_id = msg.tool_call_id.as_deref().unwrap_or("");
+                // Tool response message.
+                // tool_call_id holds the function name in Gemma's response DSL.
+                let func_name = msg.tool_call_id.as_deref().unwrap_or("unknown");
                 prompt.push_str(&format!(
-                    "<|turn>tool\n<|tool_response>id:{}\n{}<tool_response|><turn|>\n",
-                    tool_id, msg.content
+                    "<|turn>tool\n<|tool_response>response:{}{{value:<|\"|>{}<|\"|>}}<tool_response|><turn|>\n",
+                    func_name, msg.content
                 ));
             }
             "assistant" => {
-                // Check if this assistant message contains tool calls
+                // Check if this assistant message contains tool calls.
                 if let Some(calls) = &msg.tool_calls {
                     let mut turn_content = String::new();
                     for call in calls {
+                        let dsl_args = json_args_to_gemma_dsl(&call.arguments);
                         turn_content.push_str(&format!(
-                            "<|tool_call>{}({})<tool_call|>",
-                            call.name, call.arguments
+                            "<|tool_call>call:{}{{{}}}<tool_call|>",
+                            call.name, dsl_args
                         ));
                     }
                     prompt.push_str(&format!("<|turn>model\n{}<turn|>\n", turn_content));
@@ -130,14 +175,23 @@ pub fn format_chat_prompt_with_options(messages: &[ChatMessage], options: &ChatF
                     prompt.push_str(&format!("<|turn>model\n{}<turn|>\n", msg.content));
                 }
             }
+            "system" | "developer" => {
+                // Should not appear here (consumed above), but emit as-is for safety.
+                prompt.push_str(&format!("<|turn>system\n{}<turn|>\n", msg.content));
+            }
             other => {
                 prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", other, msg.content));
             }
         }
     }
 
-    // Begin generation turn (matches GGUF chat template: just "<|turn>model\n")
+    // Begin generation turn.
     prompt.push_str("<|turn>model\n");
+
+    // When thinking is disabled, suppress thinking channel.
+    if !options.enable_thinking {
+        prompt.push_str("<|channel>thought\n<channel|>");
+    }
 
     prompt
 }
@@ -156,7 +210,8 @@ mod tests {
         let prompt = format_chat_prompt(&messages);
         assert!(prompt.starts_with("<bos>"));
         assert!(prompt.contains("<|turn>user\nHello<turn|>"));
-        assert!(prompt.ends_with("<|turn>model\n"));
+        // Thinking suppression appended when enable_thinking is false.
+        assert!(prompt.ends_with("<|channel>thought\n<channel|>"));
     }
 
     #[test]
@@ -166,8 +221,12 @@ mod tests {
             msg("user", "Hi"),
         ];
         let prompt = format_chat_prompt(&messages);
+        // System message should be in the preamble turn.
         assert!(prompt.contains("<|turn>system\nYou are helpful.<turn|>"));
         assert!(prompt.contains("<|turn>user\nHi<turn|>"));
+        // System message must NOT appear as a second system turn.
+        let system_turn_count = prompt.matches("<|turn>system\n").count();
+        assert_eq!(system_turn_count, 1, "system turn should appear exactly once");
     }
 
     #[test]
@@ -205,15 +264,86 @@ mod tests {
         let options = ChatFormatOptions { enable_thinking: true, ..Default::default() };
         let prompt = format_chat_prompt_with_options(&messages, &options);
         assert!(prompt.contains("<|think|>"));
+        // No suppression when thinking is enabled.
         assert!(!prompt.contains("<|channel>thought\n<channel|>"));
     }
 
     #[test]
-    fn test_thinking_disabled_no_suppression_tokens() {
+    fn test_thinking_disabled_suppression_tokens() {
         let messages = vec![ChatMessage { role: "user".into(), content: "Hi".into(), tool_calls: None, tool_call_id: None }];
         let prompt = format_chat_prompt_with_options(&messages, &ChatFormatOptions::default());
-        // Matches GGUF chat template: no thinking suppression tokens appended
-        assert!(prompt.ends_with("<|turn>model\n"));
-        assert!(!prompt.contains("<|channel>"));
+        // Official template: suppress thinking when enable_thinking is false.
+        assert!(prompt.ends_with("<|channel>thought\n<channel|>"));
+        assert!(prompt.contains("<|channel>"));
+    }
+
+    #[test]
+    fn test_tool_call_format() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![ToolCallInfo {
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Bangkok"}"#.into(),
+                }]),
+                tool_call_id: None,
+            },
+        ];
+        let prompt = format_chat_prompt(&messages);
+        assert!(
+            prompt.contains("<|tool_call>call:get_weather{city:<|\"|>Bangkok<|\"|>}<tool_call|>"),
+            "got: {}", prompt
+        );
+    }
+
+    #[test]
+    fn test_tool_response_format() {
+        let messages = vec![
+            ChatMessage {
+                role: "tool".into(),
+                content: "25°C sunny".into(),
+                tool_calls: None,
+                tool_call_id: Some("get_weather".into()),
+            },
+        ];
+        let prompt = format_chat_prompt(&messages);
+        assert!(
+            prompt.contains("<|tool_response>response:get_weather{value:<|\"|>25°C sunny<|\"|>}<tool_response|>"),
+            "got: {}", prompt
+        );
+    }
+
+    #[test]
+    fn test_system_message_in_preamble_with_tools() {
+        let params = serde_json::json!({"type": "object", "properties": {}});
+        let options = ChatFormatOptions {
+            tools: vec![ToolDef {
+                name: "search".into(),
+                description: Some("Search the web".into()),
+                parameters: Some(params),
+            }],
+            enable_thinking: false,
+        };
+        let messages = vec![
+            msg("system", "You are a helpful assistant."),
+            msg("user", "Search for Rust"),
+        ];
+        let prompt = format_chat_prompt_with_options(&messages, &options);
+        // System message content must appear once in the preamble.
+        assert!(prompt.contains("You are a helpful assistant."));
+        let system_turn_count = prompt.matches("<|turn>system\n").count();
+        assert_eq!(system_turn_count, 1);
+        // Tool declaration must be in the same preamble.
+        assert!(prompt.contains("<|tool>declaration:search"));
+    }
+
+    #[test]
+    fn test_format_chat_prompt_backward_compat() {
+        // format_chat_prompt (no options) must still work.
+        let messages = vec![msg("user", "Hello")];
+        let prompt = format_chat_prompt(&messages);
+        assert!(prompt.starts_with("<bos>"));
+        assert!(prompt.contains("<|turn>user\nHello<turn|>"));
     }
 }
