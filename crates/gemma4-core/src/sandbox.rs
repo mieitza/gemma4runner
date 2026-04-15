@@ -265,7 +265,11 @@ impl Sandbox {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String> {
-        match tool_name {
+        // Normalize tool name: "python_interpreter {code" -> "python_interpreter"
+        let normalized = tool_name
+            .split_whitespace().next().unwrap_or(tool_name)
+            .split(':').next().unwrap_or(tool_name);
+        match normalized {
             "execute_code" | "python_interpreter" | "python" | "code_interpreter" => {
                 let language = arguments
                     .get("language")
@@ -325,10 +329,20 @@ impl Sandbox {
 
     /// Return `true` if `tool_name` is a sandbox tool.
     pub fn is_sandbox_tool(tool_name: &str) -> bool {
-        matches!(
+        // Check exact matches first
+        if matches!(
             tool_name,
             "execute_code" | "run_command" | "write_file" | "read_file" | "list_files"
                 | "python_interpreter" | "python" | "code_interpreter"
+        ) {
+            return true;
+        }
+        // Check prefix matches for model variations like "python_interpreter {code"
+        let trimmed = tool_name.split_whitespace().next().unwrap_or(tool_name);
+        let base = trimmed.split(':').next().unwrap_or(trimmed);
+        matches!(
+            base,
+            "execute_code" | "run_command" | "python_interpreter" | "python" | "code_interpreter"
         )
     }
 
