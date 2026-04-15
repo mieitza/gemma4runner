@@ -121,6 +121,30 @@ fn unescape_literals(s: &str) -> String {
     out
 }
 
+/// Truncate code at the first non-code marker.
+/// The model often generates code then continues with fabricated output/explanation.
+fn truncate_code(code: &str) -> String {
+    // Cut at first triple-backtick (model closes its own code block)
+    let code = if let Some(pos) = code.find("```") {
+        &code[..pos]
+    } else {
+        code
+    };
+    // Cut at "**Output:**" or similar markers
+    let code = if let Some(pos) = code.find("**Output") {
+        &code[..pos]
+    } else {
+        code
+    };
+    // Cut at "(Note:" explanation
+    let code = if let Some(pos) = code.find("(Note:") {
+        &code[..pos]
+    } else {
+        code
+    };
+    code.trim_end().to_string()
+}
+
 /// Parse a single tool call body (the text after "call:").
 ///
 /// Handles two formats:
@@ -157,8 +181,11 @@ fn parse_single_call(body: &str) -> Option<ParsedToolCall> {
     let (name, code) = if let Some(newline_pos) = body_ref.find('\n') {
         let raw_name = body_ref[..newline_pos].trim_end_matches(|c: char| c == ':' || c == ' ');
         let clean_name = raw_name.split(':').next().unwrap_or(raw_name).trim();
-        let code = &body_ref[newline_pos + 1..];
-        (clean_name.to_string(), code.to_string())
+        let raw_code = &body_ref[newline_pos + 1..];
+        // Truncate at first non-code marker — model often appends fabricated
+        // output, markdown, or explanation after the code.
+        let code = truncate_code(raw_code);
+        (clean_name.to_string(), code)
     } else {
         return None;
     };
