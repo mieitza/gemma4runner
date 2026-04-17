@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use super::common::{FinishReason, Message, Usage};
 use super::common;
 
+/// Accept any OpenAI-compatible chat completion request.
+/// Unknown fields are silently ignored for maximum compatibility.
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -30,6 +32,9 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub include_thinking: Option<bool>,
+    // Catch-all for unknown fields (stop, n, logprobs, response_format, user, etc.)
+    #[serde(flatten)]
+    pub _extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_temperature() -> Option<f64> { Some(1.0) }

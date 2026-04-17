@@ -27,7 +27,7 @@ pub async fn chat_completions(
 
     let messages: Vec<ChatMessage> = request.messages.iter().map(|m| ChatMessage {
         role: match m.role {
-            common::Role::System => "system".into(),
+            common::Role::System | common::Role::Developer => "system".into(),
             common::Role::User => "user".into(),
             common::Role::Assistant => "assistant".into(),
             common::Role::Tool => "tool".into(),
